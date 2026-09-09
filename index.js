@@ -140,7 +140,7 @@
     // Default rice source: only kicks in if no ?query file/hash and no
     // localStorage save already populated the editor during construction.
     if (window.location.href.indexOf('?') < 0 && !window.me.editor.getText().length) {
-      window.me.downloadFile('part1_framebuffer.rice');
+      window.me.downloadFile('examples/part1_framebuffer.rice');
     }
     window.onresize = function() { onResize(false); };
 } ());

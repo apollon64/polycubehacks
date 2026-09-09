@@ -1,0 +1,71 @@
+// First we define a framebuffer and a depth buffer.
+// This variant demonstrates a whole-frame blit instead of drawing each
+// logical pixel with its own fillRect call: the framebuffer is a uint8
+// RGBA byte array -- the exact byte layout putImageData expects -- with
+// the pixel-size upscale done as plain in-buffer writes, then pushed to
+// the screen with a single blitRGBA() call at the end of the frame
+// instead of one fillrect() call per logical pixel.
+
+enum{
+  FRAMEBUFFER_WIDTH=2*128,
+  FRAMEBUFFER_HEIGHT=2*128,
+  PIXEL_SIZE=4,
+  OUT_WIDTH=512,   // FRAMEBUFFER_WIDTH*PIXEL_SIZE
+  OUT_HEIGHT=512   // FRAMEBUFFER_HEIGHT*PIXEL_SIZE
+};
+
+static uint8 framebuf[OUT_WIDTH*OUT_HEIGHT*4];
+static double depthbuf[FRAMEBUFFER_WIDTH*FRAMEBUFFER_HEIGHT];
+
+/*main*/()
+{
+  static otim,dt;
+  time=klock(0);
+  dt=time-otim;
+  otim=time;
+
+  cls(0,0,0); // clear screen to black
+
+  clearFrame();
+
+  setpixel(3,4,255,32,32);
+
+  // draw some lines
+  for(int i=0; i<50; i++) {
+    setpixel(50+i,50+i,0,0,255);
+    setpixel(50+50-i,50+i,0,255,0);
+  }
+
+  blitRGBA(framebuf, OUT_WIDTH, OUT_HEIGHT);
+
+  setcol(255,0,0);
+  moveto(10, yres-20);
+  printf("Framebuffer blit test (blitRGBA, single putImageData call) %d fps, %.3f mspf", int(1.0/dt), dt);
+}
+
+// Writes one logical framebuffer pixel, upscaled PIXEL_SIZE x PIXEL_SIZE
+// directly into the RGBA byte buffer -- plain array writes only, no
+// canvas or function-call overhead per sub-pixel.
+setpixel(x,y,r,g,b) {
+  for (int dy=0; dy<PIXEL_SIZE; dy++) {
+    for (int dx=0; dx<PIXEL_SIZE; dx++) {
+      int base = int(((y*PIXEL_SIZE+dy)*OUT_WIDTH + (x*PIXEL_SIZE+dx))*4);
+      framebuf[base+0] = r;
+      framebuf[base+1] = g;
+      framebuf[base+2] = b;
+      framebuf[base+3] = 255;
+    }
+  }
+}
+
+clearFrame()
+{
+  for (int y = 0; y < FRAMEBUFFER_HEIGHT; y++)
+  {
+    for (int x = 0; x < FRAMEBUFFER_WIDTH; x++)
+    {
+      setpixel(x, y, 32, 32, 32);
+      depthbuf[y*FRAMEBUFFER_WIDTH+x] = 1.0;
+    }
+  }
+}

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<!-- saved from url=(0040)https://rice.moonedit.com/edit/?h=qTcS3G -->
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">
+<title>PolyCube: Document</title>
+<link rel="shortcut icon" href="https://rice.moonedit.com/favicon.ico">
+<link rel="icon" type="image/vnd.microsoft.icon" href="https://rice.moonedit.com/favicon.ico">
+<style type="text/css">
+  @font-face {
+      font-family: "sans-pro";
+      src: url("../fonts/SourceSansPro-Regular.ttf.woff") format('woff');
+  }
+  body 
+  {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: sans-serif;
+      font-size: 20px;
+      background-color: black;
+  }
+  #toolbar
+  {
+      position: absolute;
+      padding: 10px;
+      left: 710px;
+      top: 10px;
+      width: 90px;
+      height: 40px;
+      visibility: hidden;
+  }
+  button
+  {
+      width: 76px;
+      height: 20px;
+      margin: 3px;
+      font-size: 10pt;
+      font-family: Consolas;
+      background-color: transparent;
+      border: 1px solid;
+      border-color: #808080;
+      color: #808080;
+      outline-color: #c0c0c0;
+  }
+  .arrow-bar
+  {
+      position: relative;
+      left: 10px;
+      top: 6px;
+	    width: 40px; 
+	    height: 0;
+	    border-top: 2px solid #808080;
+  }
+  .arrow-right
+  {
+      position: relative;
+      left: 50px;
+      top: 0px;
+	    width: 0; 
+	    height: 0; 
+	    border-top: 5px solid transparent;
+	    border-bottom: 5px solid transparent;
+	    border-left: 5px solid #808080;
+  }
+  #title
+  {
+    color: #6c6c6c;
+    font-family: sans-pro, sans-serif;
+    font-size: 20px;
+  }
+  #newfile
+  {
+    color: #6c6c6c;
+    background-color: #252525;
+    border: 1px solid #505050;
+  }
+  .a_div 
+  {
+    color: #6c6c6c;
+    font-family: Consolas;
+    font-size: 10pt;
+  }
+  .a_div:hover
+  {
+   cursor: pointer;
+   text-decoration: underline;
+  }
+  input[type="text"]
+  {
+    width: 170px;
+    /* background-color: #1B1B1B; */
+    background-color: transparent;
+    color: #6c6c6c;
+    border: none;
+    /* border-bottom: 1px solid #505050; */
+    border: 1px solid #505050;
+    padding: 2px;
+    /* font-family: Consolas; */
+    font-family: sans-pro, sans-serif;
+    font-size: 20px;
+    margin-bottom: 10px;
+  }
+  ::-webkit-input-placeholder { /* WebKit, Blink, Edge */
+    color: #505050;
+  }
+  :-moz-placeholder { /* Mozilla Firefox 4 to 18 */
+    color: #505050;
+    opacity:  1;
+  }
+  ::-moz-placeholder { /* Mozilla Firefox 19+ */
+    color: #505050;
+    opacity:  1;
+  }
+  :-ms-input-placeholder { /* Internet Explorer 10-11 */
+    color: #505050;
+  }
+  .error {
+    color: #c01f1f;
+    /* font-size: 18px;*/
+    display: inline;
+    margin-left: 10px;
+    /*margin-top: -4px;*/
+  }
+</style>
+</head>
+<body style="background-color: rgb(37, 37, 37);">
+<div id="main" style="position: absolute; padding:0px; left:0px; top:0px;">
+  <div id="leftbar" style="position: absolute; left:0px; top:300px; width:20px; height:49px; display: none;" onclick="me.setFullscreen?me.setFullscreen(false):me.setFullpreview(false)" title="[F2] Show editor">
+    <div style="position: relative; left:11px; top:10px; width:3px; height:3px; background:#555;"></div>
+    <div style="position: relative; left:11px; top:20px; width:3px; height:3px; background:#555;"></div>
+    <div style="position: relative; left:11px; top:30px; width:3px; height:3px; background:#555;"></div>
+  </div>
+  <div id="editor" style="position: absolute; left:10px; top:10px;"><div class="MEditor"><div style="overflow: hidden; position: relative; width: 3px; height: 0px;"><textarea autocorrect="off" autocapitalize="off" spellcheck="false" tabindex="0" style="position: absolute; padding: 0px; width: 1000px; height: 1em; outline: none;"></textarea></div><div style="position: absolute; padding: 0px; height: 824px; width: 785px;"><canvas width="785" height="824"></canvas></div></div></div>
+  <div id="toolbar" style="position: absolute; left: 795px; top: 10px; visibility: visible;">
+    <button onclick="me.compile()" title="CTRL+ENTER" style="height: 38px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Compile <div class="arrow-bar"></div><div class="arrow-right"></div></button><br>
+    <button id="set_fullscreen" onclick="me.setFullscreen?me.setFullscreen(true):me.setFullpreview(true)" style="height: 38px; margin-top: 6px; margin-bottom: 36px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);" title="Press [F2] to go back">Hide editor</button><br>
+    <button onclick="me.editor.markHistory()" title="CTRL+H" style="height: 38px; margin-top: 6px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Mark revision</button>
+    <button onclick="me.editor.unmarkHistory()" title="CTRL+U" style="height: 38px; margin-top: 6px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Unmark revision</button>
+    <button onclick="me.editor.toggleHistory()" title="F7 = toggle, F6/F8 = back/forw." style="color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">History</button><br>
+    <button onclick="me.historyBack(true)" title="Ctrl+F6 = prev. revision" style="width: 32px; margin-right: 3px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">&lt;-</button>
+    <button onclick="me.historyForward(true)" title="Ctrl+F8 = next revision" style="width: 32px; margin-left: 3px; margin-bottom: 36px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">-&gt;</button><br>
+    <!--
+    <button onclick="me.setStyle('dark')" style="height:38px; margin-top: 5px;">Dark style</button>
+    <button onclick="me.setStyle('light')" style="height:38px; margin-top: 6px;">Light style</button>
+    -->
+    <!--<button onclick="me.toggleSyntaxHilight()" style="height:38px; margin-top: 5px;">Color on</button>-->
+    <!--
+    <div style="width:76px; height:30px; margin: 3px; margin-top: 6px;">
+      <button onclick="me.decFontSize()" style="width:35px; height:30px; margin: 0; padding: 0;">aA-</button>
+      <button onclick="me.incFontSize()" style="width:35px; height:30px; margin: 0; padding: 0;">aA+</button>
+    </div>
+    -->
+    <button id="open_file" onclick="document.getElementById(&#39;openFile&#39;).click()" style="display: none; height: 38px; margin-top: 6px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Open file</button>
+    <!-- <button onclick="" style="height:38px; margin-top: 6px;">Download text</button> -->
+    <button id="save_offline" onclick="me.saveToLocalStore()" title="" style="display: none; height: 38px; margin-top: 6px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Save offline</button>
+    <button id="save_online" onclick="me.saveOnline()" title="Ctrl+S" style="display: block; height: 38px; margin-top: 6px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);">Save</button>
+    <input style="visibility:hidden;display:none" id="openFile" type="file" name="myFiles" onchange="me.onFileChange()">
+  </div>
+  <div id="preview" style="position: absolute; left: 895px; top: 10px; padding: 0px;"><div id="mainCanvas" tabindex="1" style="position: absolute; height: 824px; width: 785px;"><canvas width="785" height="824"></canvas></div></div>
+  <div id="console" style="position: absolute; left: 10px; top: 844px; padding: 0px; display: none;"><div class="MEditor"><div style="overflow: hidden; position: relative; width: 3px; height: 0px;"><textarea autocorrect="off" autocapitalize="off" spellcheck="false" tabindex="0" style="position: absolute; padding: 0px; width: 1000px; height: 1em; outline: none;"></textarea></div><div style="position: absolute; padding: 0px; height: 100px; width: 785px;"><canvas width="785" height="100"></canvas></div></div></div>
+  <div id="srgbox" style="position: absolute; left: 14px; top: 360px; padding: 0px; display: none; width: 408px; height: 28px;"><div class="MEditor"><div style="overflow: hidden; position: relative; width: 3px; height: 0px;"><textarea autocorrect="off" autocapitalize="off" spellcheck="false" tabindex="0" style="position: absolute; padding: 0px; width: 1000px; height: 1em; outline: none;"></textarea></div><div style="position: absolute; padding: 0px; height: 28px; width: 408px;"><canvas width="408" height="28"></canvas></div></div></div>
+</div>
+<div id="logo" style="position: absolute; padding:0px; right:8px; bottom:3px;">
+  <a href="https://rice.moonedit.com/" target="_blank"><img id="logo_img" src="./PolyCube_ Document_files/polycubesm.png" width="142" height="58/"></a>
+</div>
+<div id="title" style="position: absolute; left: 10px; bottom: 28px; padding: 0px; height:25px">
+  <input type="text" id="edit_title" maxlength="64" style="width:260px;display:inline" placeholder="Enter script name" onfocus="me.startEditTitle()">
+  <div id="edit_title_error" class="error"></div>
+</div>
+<div id="player" style="position: absolute; left: 895px; bottom: 31px; padding: 0px; height: 25px; display: block;">
+  <button id="preview_revert" onclick="me.previewRevert()" style="display: inline; width: 30px; height: 31px; padding: 0px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);" title="Restart"><img src="./PolyCube_ Document_files/revertbut.png" width="22" height="23"></button>
+  <button id="preview_pause" onclick="me.previewPause()" style="display: inline; width: 30px; height: 31px; padding: 0px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);" title="Pause"><img src="./PolyCube_ Document_files/pausebut.png" width="22" height="23"></button>
+  <button id="preview_play" onclick="me.previewPlay()" style="display: inline; width: 30px; height: 31px; padding: 0px; color: rgb(108, 108, 108); border-color: rgb(80, 80, 80); outline-color: rgb(128, 128, 128);" title="Play"><img id="play_icon" src="./PolyCube_ Document_files/playbut.png" width="22" height="23" title="Play"></button>
+</div>
+<script type="text/javascript" src="./transpack.js"></script>
+<script type="text/javascript" src="./evalpack.js"></script>
+<script type="text/javascript" src="./mepack.js"></script>
+<script type="text/javascript" src="./index.js"></script>
+
+
+</body></html>

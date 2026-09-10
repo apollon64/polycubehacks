@@ -147,10 +147,10 @@ cube_applyForce(cube_t& cube, vec3 F, vec3 R){
 cube_isInCube(cube_t& cube, vec3 otherPos){
     vec3 loc_to_r = otherPos - cube.loc;
     vec3 R = orient_toOri( cube.ori, loc_to_r );
+    
+    double hs = double(cubeSize) * .5;
 
-    if (fabs(R.x) < cubeSize/2 && 
-        fabs(R.y) < cubeSize/2 && 
-        fabs(R.z) < cubeSize/2 ){
+    if (fabs(R.x) < hs && fabs(R.y) < hs &&  fabs(R.z) < hs ) {
        return 1;
     }
     return 0;
@@ -162,29 +162,29 @@ vec3 cube_forceField(cube_t cube, vec3 pt){
     
     // what is the point in local coords?
     vec3 R = orient_toOri(cube.ori, loc_to_pt );
-    
+    double hs = double(cubeSize) * .5;
 
     vec3 F = vec3(0.);
     if( fabs(R.x) > fabs(R.y) && fabs(R.x) > fabs(R.z) ){
       
       if( R.x > 0){
-         F.x = spring*(cubeSize/2-R.x);
+         F.x = spring*(hs-R.x);
       }else{
-         F.x = -spring*(R.x+cubeSize/2);
+         F.x = -spring*(R.x+hs);
       }
       
     }else if( fabs(R.y) > fabs(R.z) ){
       if(R.y>0){
-         F.y = spring*(cubeSize/2-R.y);
+         F.y = spring*(hs-R.y);
       }else{
-         F.y = -spring*(R.y+cubeSize/2);
+         F.y = -spring*(R.y+hs);
       }
       
     }else{
       if(R.z>0){
-         F.z = spring*(cubeSize/2-R.z);
+         F.z = spring*(hs-R.z);
       }else{
-         F.z = -spring*(R.z+cubeSize/2);
+         F.z = -spring*(R.z+hs);
       }
     }
     
@@ -328,13 +328,14 @@ vec3 cube_wallFeild(cube_t cube, vec3 R){
 cube_walls(cube_t& cube){
     if(cube_wallHit(cube)){
       
+      double hs = double(cubeSize) * .5;
       for(i=0;i<=pointSampling;i++){
         for(j=0;j<=pointSampling;j++){
           for(k=0;k<=pointSampling;k++){
             vec3 sample_loc = vec3( 
-                               i*cubeSize/pointSampling-cubeSize/2,
-                               j*cubeSize/pointSampling-cubeSize/2,
-                               k*cubeSize/pointSampling-cubeSize/2
+                               i*cubeSize/pointSampling-hs,
+                               j*cubeSize/pointSampling-hs,
+                               k*cubeSize/pointSampling-hs
                           );
             vec3 world_pos = orient_toWorld(cube.ori, sample_loc);
             
@@ -359,9 +360,9 @@ cube_collide(cube_t& cubeA, cube_t& cubeB ){
       for(i=0;i<=pointSampling;i++){
         for(j=0;j<=pointSampling;j++){
           for(k=0;k<=pointSampling;k++){
-            vec3 sample_loc = vec3(i*cubeSize/pointSampling-cubeSize/2,
-                                  j*cubeSize/pointSampling-cubeSize/2,
-                                  k*cubeSize/pointSampling-cubeSize/2
+            vec3 sample_loc = vec3(i*cubeSize/pointSampling-cubeSize/2.,
+                                  j*cubeSize/pointSampling-cubeSize/2.,
+                                  k*cubeSize/pointSampling-cubeSize/2.
              );
              
             vec3 world_out = orient_toWorld( cubeA.ori, sample_loc);
@@ -457,7 +458,7 @@ user_interaction() {
 }
 
 draw() {    
-  sc = cubeSize/2;
+  sc = cubeSize/2.;
   for(i=0; i < numCubes; i++){
       cube_t& cube = cubes[i];
       vec3 loc = cubes[i].loc;

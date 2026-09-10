@@ -26,7 +26,7 @@ static int cube_mesh;
     }
     cubetex = 0;
     if (keystatus[57]) cubetex = 2;
-    int ygrab = (numframes%blocks)*blockheight;// + i;
+    int ygrab = int(numframes%blocks)*int(blockheight);// + i;
     glCullFace(GL_BACK);
 
     cls(0);
@@ -115,7 +115,7 @@ draw_rubber_cube()
     glDisable(GL_SCISSOR_TEST);
 }
 
-createCube()
+int createCube()
 {
     glBeginMesh(4);
     cube();//doesnt work with GL_QUAD?
@@ -333,7 +333,7 @@ vec3 normals[6*4] = { //TODO not verified if correct
     glEnd();
 }
 
-createSphere()   // Returns a mesh_id for glMesh(int mesh_id)
+int createSphere()   // Returns a mesh_id for glMesh(int mesh_id)
 // enum{sectorCount=18, stackCount=36, vertCount=(sectorCount+1)*(stackCount+1)};
 // enum{sectorCount=9, stackCount=18, vertCount=(sectorCount+1)*(stackCount+1)};
 {
@@ -351,7 +351,7 @@ createSphere()   // Returns a mesh_id for glMesh(int mesh_id)
     static vec3 normals[vertCount];
     static vec2 texCoords[vertCount];
     num_verts = 0;
-    for (i = 0; i <= stackCount; i += 1)
+    for (int i = 0; i <= stackCount; i += 1)
     {
         stackAngle = PI / 2 - float(i) * stackStep;        // starting from pi/2 to -pi/2
         xy = radius * cos(stackAngle);             // r * cos(u)
@@ -359,7 +359,7 @@ createSphere()   // Returns a mesh_id for glMesh(int mesh_id)
 
         // add (sectorCount+1) vertices per stack
         // the first and last vertices have same position and normal, but different tex coords
-        for (j = 0; j <= sectorCount; j += 1)
+        for (int j = 0; j <= sectorCount; j += 1)
         {
             sectorAngle = float(j) * sectorStep;           // starting from 0 to 2pi
 
@@ -384,12 +384,12 @@ createSphere()   // Returns a mesh_id for glMesh(int mesh_id)
     static int indices[MAX_SPHERE_INDICES];
     // static int lineIndices[stackCount*sectorCount*2];
     num_indices = 0;
-    for (i = 0; i < stackCount; i += 1)
+    for (int i = 0; i < stackCount; i += 1)
     {
         int k1 = i * (sectorCount + 1);
         int k2 = k1 + sectorCount + 1;
 
-        for (j = 0; j < sectorCount; j += 1)
+        for (int j = 0; j < sectorCount; j += 1)
         {
             // 2 triangles per sector excluding first and last stacks
             // k1 => k2 => k1+1

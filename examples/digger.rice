@@ -1,0 +1,325 @@
+#use glsl_math
+#option antialias 0
+#option preserve_buffer 1
+
+static time, otim;
+static int frames = 0;
+static int fps = 0;
+static frameTimer = 0;
+static double dt = 0.0;
+()
+{
+   time = klock(0);
+   dt = time - otim;
+   otim = time;
+   
+   if (time > frameTimer)
+   {
+     frameTimer = time + 1;
+     fps = frames;
+     frames = 0;
+   }
+   frames++;
+   
+   //glClear();
+   cls(0);
+   
+   if(numframes==0)
+   {
+     glEnable(GL_DEPTH_TEST);
+     glCullFace(GL_BACK);
+     
+     glBeginMesh(0);
+     drawcubeslow();
+     glEndMesh();
+   }
+   gluPerspective(60, xres/yres, 0.1, 1000.0);
+   glCullFace(GL_BACK);
+   glUniform1i("tex0", 0);
+   
+   glKlockStart();
+   DrawScene();
+   cputime = glKlockElapsed();
+   
+   setfont(6,8);
+   moveto(0,8);
+   setcol(0xffffff);
+   printf("FPS:%d, mspf to generate scene: %g", fps, cputime);
+}
+
+
+DrawScene()
+{
+   t = time;
+   tim = t / 4;
+    
+   //mat4 u_world = mat4(1.0);
+   //rotate(u_world, mousx/xres*360, 0,1,0);
+   //rotate(u_world, mousy/yres*360, 0,0,1);
+   
+   //mat4 view = mat4(1.0);
+   //lookAt(view, 0,0,-1.0, 0,0,0, 0,1,0);
+   //mat4 u_worldview = view * u_world;
+   
+   glLoadIdentity(); 
+   //glTranslate(-.5,-.5,-1.7);
+   gluLookAt(-5,25,-45.0, 0,0,0, 0,1,0);
+   glRotate(mousx/xres*360, 0,1,0);
+   glRotate(mousy/yres*90, 0,0,1);
+   
+   //mat4 u_worldviewproj = mat4(1.0);
+   //glGetMatrix(u_worldviewproj);
+   //glUniformMatrix4fv("u_worldviewproj", u_worldviewproj);
+   //glUniformMatrix4fv("u_worldview", u_worldview);
+   //glUniformMatrix4fv("u_world", u_world);
+   
+   wheelspeed = 2;
+   
+   
+   glPushMatrix();
+   glTranslate(-10,0,-5);
+   glColor(.2, .2, .2);
+   belt(t);
+   glColor(.5, .5, .5);
+   for(i=0; i<6; i++)
+   wheel(t*wheelspeed, 4.0*i);
+   glPopMatrix();
+   
+   glPushMatrix();
+   glTranslate(-10,0,+5);
+   glColor(.2, .2, .2);
+   belt(t);
+   glColor(.5, .5, .5);
+   for(i=0; i<6; i++)
+   wheel(t*wheelspeed, 4.0*i);
+   glPopMatrix();
+   
+   glColor(1,.5,.1);
+   
+   glPushMatrix();
+   glTranslate(0,2,0);
+   glScale(4,2.5,4);
+   cube();
+   glPopMatrix();
+   
+   // BODY
+   glPushMatrix();
+   glTranslate(0,5,0);
+   glScale(10,1,6);
+   cube();
+   glPopMatrix();
+   
+   // CABIN
+   glPushMatrix();
+   glTranslate(4,8,-3);
+   glScale(5,4,2.5);
+   cube();
+   glPopMatrix();
+   
+   glPushMatrix();
+   glRotate(-15+cos(t)*10,0,0,1);
+   glTranslate(7,12,0);
+   glRotate(-25+cos(t)*20,0,0,1);
+   
+   glPushMatrix();
+     glScale(1,6,1);
+     cube();
+   glPopMatrix();
+   
+   glTranslate(3,8,0);
+   glRotate(-55+cos(t)*20,0,0,1);
+   glPushMatrix();
+     glScale(.8,6,1);
+     cube();
+   glPopMatrix();
+   
+   glTranslate(4,8,0);
+   glRotate(-65+cos(t)*20,0,0,1);
+   glPushMatrix();
+     glScale(0.8,4,1);
+     cube();
+   glPopMatrix();
+   
+   glTranslate(3,4,0);
+   
+   glColor(.2,.2,.2);
+   glPushMatrix();
+     glRotate(-0+cos(t)*10.,0,0,1);
+     glScale(3.5,2,2);
+     cube();
+   glPopMatrix();
+   
+   glPopMatrix();
+}
+
+wheel(t,x)
+{
+  steps = 8;
+  for(i=0; i<steps; i++)
+  {
+  a = 2*PI*i/steps;
+  glPushMatrix();
+  glTranslate(x,0,0);
+  glRotate( (a+t)/PI*180,0,0,1);
+  glScale(.1,2,.5);
+  cube();
+  glPopMatrix();
+  }
+}
+
+belt(t)
+{
+   steps = 60;
+   for(i=0; i<steps; i++)
+   {
+      tt = (.1*t+i/steps) % 1.0;
+      pointOnBelt(tt);
+   }
+}
+
+pointOnBelt(t)
+{
+   beltlen = 20;
+   circsteps = .2;
+   lensteps = 1 - circsteps;
+   circ1 = circsteps/2;
+   circ2 = circsteps + lensteps/2;
+   len1 = circsteps/2 + lensteps/2;
+   
+   len = 5;
+   hei = 5;
+   vec3 pos = vec3(0,0,0);
+   tx = 0;
+   ty = 0;
+   ang = 0;
+   
+   
+   if (t < circ1)
+   {
+     a = PI/2 + t/circ1 * PI;
+     ca = cos(a);
+     sa = sin(a);
+     x = len*ca * .5;
+     y = hei*sa * .5;
+   
+     tx = x;
+     ty = y;
+     ang = 90 + a / PI * 180;
+   }
+   else if (t<len1)
+   {
+     pos.x += (t-len1)*2.5*beltlen + beltlen;
+     ty = -2.5;
+     ty += cos(t*80)*.2;
+   }
+   
+   else if (t < circ2)
+   {
+     eo = len1;
+     a = -PI/2 + (t-eo)/circ1 * 1 * PI;
+     ca = cos(a);
+     sa = sin(a);
+     x = len*ca * .5 + beltlen;
+     y = hei*sa * .5;
+   
+     tx = x;
+     ty = y;
+     ang = 90 + a / PI * 180;
+   } else {
+     pos.x += (t-1)*-2.5*beltlen;
+     ty = 2.5;
+   }
+   
+   glPushMatrix();
+   glTranslate(pos.x+tx,pos.y+ty,pos.z);
+   glRotate(ang, 0, 0, 1);
+   glScale(.5, .2, 1.4);
+   cube();
+   glPopMatrix();
+}
+
+cube()
+{
+  glMesh(0);
+}
+
+drawcubeslow()
+{
+   glBegin(GL_QUADS);
+      glNormal(0,1,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0, 1.0, 1.0);
+   
+      glNormal(0,-1,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0,-1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0,-1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0,-1.0);
+
+      glNormal(0,0,1);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0, 1.0);
+
+      glNormal(0,0,-1);
+      glTexCoord(1.0, 0.0);  glVertex(1.0,-1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+
+      glNormal(-1,0,0);
+      glTexCoord(1.0, 0.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex(-1.0,-1.0, 1.0);
+
+      glNormal(1,0,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex( 1.0, 1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex( 1.0,-1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0,-1.0);
+   glEnd();
+}
+
+
+@v: =======================
+
+varying vec4 v, c, t, p;
+varying vec3 n;
+
+uniform mat3 gl_NormalMatrix;
+
+void main()
+{
+   v = gl_Vertex;
+   c = gl_Color;
+   t = gl_MultiTexCoord0;
+   n = gl_NormalMatrix * gl_Normal;
+   p = gl_ModelViewMatrix * v;
+   gl_Position = gl_ProjectionMatrix * p;
+}
+
+@f: =======================
+
+uniform sampler2D tex0;
+
+varying vec4 v, c, t, p;
+varying vec3 n;
+
+void main()
+{
+   vec4 base = texture2D(tex0, t.xy+.125);
+   vec3 light_pos = vec3(.25,1.0,2.0);
+   vec3 light_dir = light_pos - p.xyz;
+   float dist = dot(light_dir, light_dir);
+   light_dir *= inversesqrt(dist);
+   vec3 norm = normalize(n);
+   float diffuse = max(0.0, dot(norm, light_dir))*(2400.0/dist);
+   float spec = max(0.0,dot(reflect(light_dir,norm),normalize(p.xyz)));
+   spec = pow(spec, 16.0)*.25;
+   gl_FragColor = base*c*diffuse + spec*vec4(1.0);
+}
+

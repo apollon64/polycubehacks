@@ -1,0 +1,639 @@
+// Based on an old openprocessing sketch by Asher Salomon
+// rewritten to evaldraw and then polycube by me.
+
+// Homework:
+// read this paper
+// The integration of angular velocity
+// by Michael Boyle
+// https://arxiv.org/pdf/1604.08139.pdf
+#use glsl_math
+
+struct {
+  vec3 loc;
+  vec3 vel;
+  vec3 force;
+  mat3 ori;
+  vec3 angVel;
+  vec3 torque;
+  double color;
+  collide_walls;
+}cube_t;
+
+enum{MAX_CUBES = 128}
+static cube_t cubes[MAX_CUBES];
+static numCubes =24;//55;//28;// 28;
+
+enum{ cubeSize = 1, 
+      momentOfIniertia = (cubeSize^2)/6;
+    }
+
+static pointSampling = 4; // 3 or 4 is okish.
+static double spring = 0.01;//0.02;
+static double damping = 0.01; //0.01
+static double grav = -0.002; //0.02
+static double physics_steps = 4;
+
+static vec3 upper_bound, lower_bound;
+struct 
+{
+  mat4 lookMat;
+  vec2 rot;
+}camera_t;
+static camera_t cam;
+static time;
+static oldtime;
+()
+{
+   time = klock();
+   dt = time - oldtime;
+   oldtime = time;
+   if ( numframes==0 )
+   {
+      siz = 5;
+      upper_bound = vec3(siz, 2*siz,siz); 
+      lower_bound = vec3(-siz, -siz, -siz );
+      reset();
+      cam.rot = vec2(0,0);
+   }
+  
+  glCullFace(GL_BACK);
+  glUniform1i("tex0", 0);
+  lookAt( cam.lookMat, vec3(0,0,-15), vec3(0,0,1), vec3(0,1,0) );
+  rotate( cam.lookMat, cam.rot.x, 1,0,0 );
+  rotate( cam.lookMat, cam.rot.y, 0,1,0 );
+  
+  glLoadMatrix (cam.lookMat);
+  static vec2 oldmouse;
+  if (bstatus>=2) {
+     cam.rot.y += .5*(mousx - oldmouse.x);
+     cam.rot.x += .5*(mousy - oldmouse.y);
+  }
+  oldmouse = vec2(mousx,mousy);
+  
+  
+  static recorded_mesh = 0;
+  if (recorded_mesh==0)
+  {
+    glBeginMesh(0);
+    glColor(1,1,1);
+    drawGLcube();
+    glEndMesh();
+  }
+  
+  for(i=0; i<physics_steps; i++) step_physics();
+  user_interaction();
+  
+  cls(32,24,127);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  gluPerspective(60, xres/yres, 0.1, 1000.0);  
+  draw();
+  setcol(255,255,0);
+  moveto(0,15);
+  if (dt>0)printf("%.2f, %.1f", int(1.0 / dt), time);
+  moveto(0,30);
+  //printOri();  
+}
+
+printOri()
+{
+  mat3 ori = cubes[0].ori;
+  vec3 i = vec3(ori[0]);
+  vec3 j = vec3(ori[1]);
+  vec3 k = vec3(ori[2]);
+  // See if cube 0 orient stays in shape (all vectors unit length)
+  printf("%f, %.2f, %.2f, %.2f\n", length(i), i.x, i.y, i.z);
+  printf("%f, %.2f, %.2f, %.2f\n", length(j), j.x, j.y, j.z);
+  printf("%f, %.2f, %.2f, %.2f",   length(k), k.x, k.y, k.z); 
+}
+
+//// Physics "Engine" in about 300 lines of GLSL math!:
+step_physics()
+{
+   for(i=0;i<numCubes;i++){
+      for(j=0;j<numCubes;j++){
+         if ( i==j ) continue;
+         cube_collide( cubes[i], cubes[j] );
+      }
+   }  
+   for(i=0; i < numCubes; i++)
+   {
+     cube_walls( cubes[i] );
+     cube_update( cubes[i], 1.0 / physics_steps );
+   }
+}
+
+cube_setup(cube_t& new_cube, vec3 pos, double color){
+   new_cube.loc = pos;
+   new_cube.vel = vec3(0.);
+   new_cube.force = vec3(0.);
+   
+   orient_create( new_cube.ori );
+   new_cube.angVel = vec3(0.);
+   new_cube.torque = vec3(0.);
+   new_cube.color = color;
+   new_cube.collide_walls = 1;
+}
+
+// F - force
+// R - point at which to apply force
+cube_applyForce(cube_t& cube, vec3 F, vec3 R){
+   // Add linear component
+   cube.force += F;
+   vec3 resultant = R - cube.loc;
+   cube.torque += cross( resultant, F );
+}
+
+// R is the position of another cube
+cube_isInCube(cube_t& cube, vec3 otherPos){
+    vec3 loc_to_r = otherPos - cube.loc;
+    vec3 R = orient_toOri( cube.ori, loc_to_r );
+
+    if (fabs(R.x) < cubeSize/2 && 
+        fabs(R.y) < cubeSize/2 && 
+        fabs(R.z) < cubeSize/2 ){
+       return 1;
+    }
+    return 0;
+}
+  
+// spring force relative to penetration depth
+vec3 cube_forceField(cube_t cube, vec3 pt){
+    vec3 loc_to_pt = pt - cube.loc;
+    
+    // what is the point in local coords?
+    vec3 R = orient_toOri(cube.ori, loc_to_pt );
+    
+
+    vec3 F = vec3(0.);
+    if( fabs(R.x) > fabs(R.y) && fabs(R.x) > fabs(R.z) ){
+      
+      if( R.x > 0){
+         F.x = spring*(cubeSize/2-R.x);
+      }else{
+         F.x = -spring*(R.x+cubeSize/2);
+      }
+      
+    }else if( fabs(R.y) > fabs(R.z) ){
+      if(R.y>0){
+         F.y = spring*(cubeSize/2-R.y);
+      }else{
+         F.y = -spring*(R.y+cubeSize/2);
+      }
+      
+    }else{
+      if(R.z>0){
+         F.z = spring*(cubeSize/2-R.z);
+      }else{
+         F.z = -spring*(R.z+cubeSize/2);
+      }
+    }
+    
+    // what is the force in world coords?
+    vec3 res = orient_toWorld(cube.ori, F);
+    return res;
+}
+  
+// Calculate the total velocity at a given point on a cube
+vec3 cube_totalVelAt(cube_t cube, vec3 point){
+   vec3 loc_to_point = point - cube.loc;
+   vec3 angular_at_p = cross( cube.angVel, loc_to_point );
+   
+   // add linear and angular velocities
+   return cube.vel + angular_at_p;
+}
+
+// Calculate new linear and angular velocity
+// Calculate derived orientation
+cube_update(cube_t& cube, dt) {
+    cube.vel += dt * cube.force;
+    cube.force = vec3(0, grav, 0);
+    cube.loc += dt * cube.vel;
+    
+    clean( cube.vel );
+    clean( cube.angVel );
+    
+    vec3 scaledTorque = cube.torque * 1.0/momentOfIniertia;
+    cube.angVel += scaledTorque;
+    cube.torque = vec3(0.); 
+    
+    // helps stability! .. suffering matrix drift :(
+    if ( length( cube.angVel ) > 1e-4 ) {
+       //orient_restore(cube.ori);
+       orient_spin(cube.ori, dt * cube.angVel);
+    }
+}
+
+clean( vec3& v ){
+   if ( length(v) < 1e-4 ){
+      v = vec3(0.);
+   }
+}
+
+// Orient
+orient_create(mat3& ori) {
+    // No identity func for mat3, so here is our own:
+    ori[0] = vec3(1,0,0);
+    ori[1] = vec3(0,1,0);
+    ori[2] = vec3(0,0,1);
+}
+
+// not used. 
+orient_restore(mat3& ori) {
+    ori[2] = cross(ori[0], ori[1] );
+    ori[1] = cross(ori[2], ori[0] );
+    ori[0] = normalize(ori[0]);
+    ori[1] = normalize(ori[1]);
+    ori[2] = normalize(ori[2]);
+}
+  
+// World to Orientation
+vec3 orient_toOri(mat3 ori, vec3 w){
+ return w * ori;
+}
+
+// Orientation to World coord
+vec3 orient_toWorld(mat3 ori, vec3 o){
+ return ori * o;
+}
+
+orient_spin(mat3 &orientation, vec3 angular_velocity) {
+    vec3 uw = normalize(angular_velocity);
+    float angle = length(angular_velocity);
+    float c = cos(angle);
+    float s = sin(angle);
+    vec3 u = vec3(uw.x, uw.y, uw.z);
+    mat3 R = mat3(
+      vec3(c + u.x * u.x * (1.0 - c), u.x * u.y * (1.0 - c) - u.z * s, u.x * u.z * (1.0 - c) + u.y * s),
+      vec3(u.y * u.x * (1.0 - c) + u.z * s, c + u.y * u.y * (1.0 - c), u.y * u.z * (1.0 - c) - u.x * s),
+      vec3(u.z * u.x * (1.0 - c) - u.y * s, u.z * u.y * (1.0 - c) + u.x * s, c + u.z * u.z * (1.0 - c))
+      );
+    orientation = transpose(R) * orientation;
+}
+
+  
+// returns true false
+cube_wallHit(cube_t cube){
+    
+    vec3 loc = cube.loc;
+    shrink = 0.866;
+    if(loc.y < lower_bound.y+cubeSize*shrink) return 1;
+    
+    
+    if (cube.collide_walls)
+    {
+    if(loc.x < lower_bound.x+cubeSize*shrink) return 1;
+    if(loc.x > upper_bound.x-cubeSize*shrink) return 1;
+    
+    if(loc.y > upper_bound.y-cubeSize*shrink) return 1;
+    
+    if(loc.z < lower_bound.z+cubeSize*shrink) return 1;
+    if(loc.z > upper_bound.z-cubeSize*shrink) return 1;
+    }
+    
+    return 0;
+}
+
+  
+vec3 cube_wallFeild(cube_t cube, vec3 R){
+    vec3 F = vec3(0.);
+    stick = 0;
+    
+    if(R.y<lower_bound.y){F.y=-(R.y-lower_bound.y)*spring;stick=1;}
+    
+    if (cube.collide_walls)
+    {
+    if(R.x<lower_bound.x){F.x=-(R.x-lower_bound.x)*spring;stick=1;}
+    if(R.x>upper_bound.x){F.x=-(R.x-upper_bound.x)*spring;stick=1;}
+    
+    
+    if(R.y>upper_bound.y){F.y=-(R.y-upper_bound.y)*spring;stick=1;}
+    
+    if(R.z<lower_bound.z){F.z=-(R.z-lower_bound.z)*spring;stick=1;}
+    if(R.z>upper_bound.z){F.z=-(R.z-upper_bound.z)*spring;stick=1;}
+    }
+
+    
+    if(stick)
+    {
+       vec3 velAtR = cube_totalVelAt(cube, R);
+       velAtR = velAtR * damping;
+       F -= velAtR;
+    }
+    return F;
+}
+
+
+// Apply a force when cube hits boundry walls
+
+cube_walls(cube_t& cube){
+    if(cube_wallHit(cube)){
+      
+      for(i=0;i<=pointSampling;i++){
+        for(j=0;j<=pointSampling;j++){
+          for(k=0;k<=pointSampling;k++){
+            vec3 sample_loc = vec3( 
+                               i*cubeSize/pointSampling-cubeSize/2,
+                               j*cubeSize/pointSampling-cubeSize/2,
+                               k*cubeSize/pointSampling-cubeSize/2
+                          );
+            vec3 world_pos = orient_toWorld(cube.ori, sample_loc);
+            
+            vec3 r = cube.loc + world_pos;
+             
+            // how much is this point outside boundary?
+            vec3 wall_force = cube_wallFeild(cube, r);
+            cube_applyForce(cube, wall_force, r);
+          }
+        }
+      }
+    }
+}
+
+cube_collide(cube_t& cubeA, cube_t& cubeB ){
+    vec3 pos_diff = cubeB.loc - cubeA.loc;
+    
+    // sqrt(3)   
+    if( length(pos_diff) < cubeSize*1.732)
+    {
+       
+      for(i=0;i<=pointSampling;i++){
+        for(j=0;j<=pointSampling;j++){
+          for(k=0;k<=pointSampling;k++){
+            vec3 sample_loc = vec3(i*cubeSize/pointSampling-cubeSize/2,
+                                  j*cubeSize/pointSampling-cubeSize/2,
+                                  k*cubeSize/pointSampling-cubeSize/2
+             );
+             
+            vec3 world_out = orient_toWorld( cubeA.ori, sample_loc);
+            vec3 R = cubeA.loc + world_out;
+            
+            if( cube_isInCube(cubeB,R) ){
+              vec3 velB = cube_totalVelAt( cubeB, R);
+              vec3 velA = cube_totalVelAt( cubeA, R);
+              
+              vec3 vel_diff = velB - velA;
+              vel_diff = vel_diff * damping;
+              
+              vec3 force_at_br = cube_forceField(cubeB, R);
+
+              vec3 F = force_at_br + vel_diff;
+              
+              cube_applyForce(cubeA, F, R); 
+              F = F * -1;
+              cube_applyForce(cubeB, F, R);
+              
+              
+            }
+          } // end for k
+        } // end for j
+      } // end for i
+    } // end dist check
+}
+
+/// End of Physics and Collision Detection
+
+random(lo,hi) {
+   return lo + rnd*(hi-lo);
+}
+
+reset() {
+   time=0;
+   cubes_per_side = pow(numCubes, 1.0/3.0)-1;
+   xp = 0; yp = 0; zp = 0;
+   vec3 cent = (upper_bound - lower_bound);
+   for(i=0; i<numCubes; i++){
+      vec3 newpos = vec3( -cubeSize + xp * cubeSize*1.05,
+          lower_bound.y + .5*cubeSize + yp * cubeSize*1.05, 
+          -cubeSize + zp * cubeSize*1.05);
+      color = (i*1.6/numCubes);
+      cube_setup( cubes[i], newpos, color );
+   
+      xp++;
+      if ( xp > cubes_per_side ){ xp = 0; zp++; }
+      if ( zp > cubes_per_side ){ zp = 0; yp++; }
+   }
+   cubes[numCubes-1].loc = vec3(0,upper_bound.y-cubeSize,upper_bound.z-cubeSize );
+}
+
+user_interaction() {
+   if (keystatus[19]) reset();
+
+   if (bstatus>0)
+   {
+      double x = (2.0 * mousx) / xres - 1.0;
+      double y = 1.0 - (2.0 * mousy) / yres;
+      double z = 1.0;
+      vec3 ray_nds = 10.0* vec3(x, y, z);
+      vec4 ray_clip = vec4(ray_nds.x, ray_nds.y, -1.0, 1.0);
+      mat4 projection_matrix;
+      glGetProjectionMatrix ( projection_matrix );
+      vec4 ray_eye = inverse(projection_matrix) * ray_clip;
+      ray_eye = vec4(ray_eye.x, ray_eye.y, -1.0, 0.0);
+      vec3 ray_wor = vec3(inverse(cam.lookMat) * ray_eye);
+      
+      cube_setup( cubes[numCubes-1], vec3(0,upper_bound.y-cubeSize,0), 0.0 );
+      mat4 mmm = inverse(cam.lookMat);
+      cubes[numCubes-1].loc = vec3( .25 * (mmm)*vec4(0,0,20,1) ) + 1.0*ray_wor;
+      vec3 look=vec3(mmm[2]);
+      cubes[numCubes-1].vel = -.5*look;
+      cubes[numCubes-1].torque = vec3(0.0,0.0,0.0);   
+      
+      cubes[numCubes-1].collide_walls = 0;
+      
+      mat4 rx, ry, rz;
+      identity(rx);
+      identity(ry);
+      identity(rz);
+      rotate ( rx, cam.rot.x, 1,0,0);
+      rotate ( ry, cam.rot.y, 0,1,0);
+      rotate ( rz, 100.0 * time, 0,0,1);
+      mat4 rr = transpose(rz * ry * rx);
+      cube_t &cube = cubes[numCubes-1];
+      mat3 &ori = cube.ori;
+      ori[0] = vec3(rr[0]);
+      ori[1] = vec3(rr[1]);
+      ori[2] = vec3(rr[2]);
+   }
+}
+
+draw() {    
+  sc = cubeSize/2;
+  for(i=0; i < numCubes; i++){
+      cube_t& cube = cubes[i];
+      vec3 loc = cubes[i].loc;
+      mat3 ori = cube.ori;
+      vec3 ui = ori[0];
+      vec3 uj = ori[1];
+      vec3 uk = ori[2];
+      mat4 orimat;
+      orimat[0] = vec4(ui.x, ui.y, ui.z, 0.0);
+      orimat[1] = vec4(uj.x, uj.y, uj.z, 0.0);
+      orimat[2] = vec4(uk.x, uk.y, uk.z, 0.0);
+      orimat[3] = vec4(loc.x, loc.y, loc.z, 1.0);
+      glUniformMatrix4fv ("ModelMatrix",orimat);
+      glUniform1f("kolor", cubes[i].color);
+      glPushMatrix();
+         glMultMatrix( orimat );
+         glScale(sc,sc,sc);
+         glMesh(0); // Mesh is fast, but vertices are baked
+         //drawGLcube();
+      glPopMatrix();
+      
+      /*
+      scalefactor = 1.2;
+      vec3 uiend = loc + scalefactor * cubes[i].ori[0];
+      vec3 ujend = loc + scalefactor * cubes[i].ori[1];
+      vec3 ukend = loc + scalefactor * cubes[i].ori[2]; 
+      setcol(255,0,0); myLine(loc, uiend);
+      setcol(255,0,0); myLine(loc, ujend);
+      setcol(255,0,0); myLine(loc, ukend);
+      */
+   } // end for each cube
+   
+   // Draw "floor"
+   mat4 model_mat;
+   identity(model_mat);
+   model_mat[3] = vec4(lower_bound.x, lower_bound.y, lower_bound.z, 1.0);
+   
+   glUniformMatrix4fv ("ModelMatrix",model_mat);
+   glColor(1,1,1);
+   glNormal(0,1,0);
+   glCullFace(GL_NONE);
+   glUniform1f("kolor", 0.0);
+   glBegin(GL_QUADS);
+      glVertex( lower_bound.x, lower_bound.y, lower_bound.z  );
+      glVertex( lower_bound.x, lower_bound.y, upper_bound.z  );
+      glVertex( upper_bound.x, lower_bound.y, upper_bound.z  );
+      glVertex( upper_bound.x, lower_bound.y, lower_bound.z  );
+   glEnd();
+}
+
+drawGLcube() // Bake it into a VBO using the beginMesh / endMesh
+{
+   glBegin(GL_QUADS);
+      glNormal(0,1,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0, 1.0, 1.0);
+   
+      glNormal(0,-1,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0,-1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0,-1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0,-1.0);
+
+      glNormal(0,0,1);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0, 1.0);
+
+      glNormal(0,0,-1);
+      glTexCoord(1.0, 0.0); glVertex(1.0,-1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+
+      glNormal(-1,0,0);
+      glTexCoord(1.0, 0.0); glVertex(-1.0, 1.0, 1.0);
+      glTexCoord(1.0, 1.0); glVertex(-1.0, 1.0,-1.0);
+      glTexCoord(0.0, 1.0); glVertex(-1.0,-1.0,-1.0);
+      glTexCoord(0.0, 0.0); glVertex(-1.0,-1.0, 1.0);
+
+      glNormal(1,0,0);
+      glTexCoord(1.0, 0.0); glVertex( 1.0, 1.0,-1.0);
+      glTexCoord(1.0, 1.0); glVertex( 1.0, 1.0, 1.0);
+      glTexCoord(0.0, 1.0); glVertex( 1.0,-1.0, 1.0);
+      glTexCoord(0.0, 0.0); glVertex( 1.0,-1.0,-1.0);
+   glEnd();
+}
+
+myLine(vec3 s, vec3 e)
+{
+  mat3 w = inverse( mat3(cam.lookMat) );
+  //mat3 w = mat3(cam.lookMat);
+  vec3 front = vec3( w[2] );
+  vec3 u = normalize(e-s);
+  vec3 cpd = cross(u,front) * .1;
+  vec3 a=s-cpd;
+  vec3 b=s+cpd;
+  vec3 c=e+cpd;
+  vec3 d=e-cpd;
+  glBegin(GL_QUADS);
+    glVertex(a.x,a.y,a.z);
+    glVertex(b.x,b.y,b.z);
+    glVertex(c.x,c.y,c.z);
+    glVertex(d.x,d.y,d.z);
+  glEnd();
+}
+
+@v: =======================
+
+varying vec4 v, c, t, p;
+varying vec3 n;
+varying vec3 FragPos;
+
+uniform mat3 gl_NormalMatrix;
+uniform mat4 ModelMatrix;
+uniform float kolor;
+
+vec3 hsv2rgb(vec3 c)
+{
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+void main()
+{
+   v = gl_Vertex;
+   c = vec4(hsv2rgb(vec3(kolor,1.0,1.0)), 1.0);//gl_Color;
+   t = gl_MultiTexCoord0;
+   n = gl_NormalMatrix * gl_Normal;
+   p = gl_ModelViewMatrix * v;
+   FragPos = vec3(ModelMatrix * vec4(v.xyz, 1.0));
+   //Normal = mat3(transpose(inverse(model))) * aNormal;  
+   //gl_Position = projection * view * vec4(FragPos, 1.0);
+   gl_Position = gl_ProjectionMatrix * p;
+}
+
+@f: =======================
+
+uniform sampler2D tex0;
+//uniform vec3 viewPos;
+
+varying vec4 v, c, t, p;
+varying vec3 n;
+varying vec3 FragPos;
+void main()
+{
+   vec4 base = texture2D(tex0, t.xy+.125);
+   vec3 light_pos = vec3(.25,1.0,2.0);
+   vec3 lightDir = normalize(light_pos - FragPos);
+   vec3 viewPos = vec3(.5);
+   
+    vec3 lightColor = vec3(1.0);
+   
+    // ambient
+    float ambientStrength = 0.1;
+    vec3 ambient = ambientStrength * lightColor;
+  	
+    // diffuse 
+    vec3 norm = normalize(n);
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 diffuse = diff * lightColor;
+    
+    // specular
+    float specularStrength = 1.5;
+    vec3 viewDir = normalize(viewPos - FragPos);
+    vec3 reflectDir = reflect(-lightDir, norm);  
+    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.);
+    vec3 specular = specularStrength * spec * lightColor;  
+        
+    vec3 result = (ambient + diffuse + specular) * base.xyz;   
+   
+   
+   gl_FragColor =c*vec4(result,1.0); //base*c*diffuse;// + spec*vec4(1.0);
+}
+

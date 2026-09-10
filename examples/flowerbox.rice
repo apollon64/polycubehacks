@@ -1,0 +1,345 @@
+#use glsl_math
+
+static float fac = 0;
+static int subdivs = 10; // play with this
+
+struct 
+{
+  vec3 p;
+  vec3 n;
+  vec3 c;
+  vec2 t;
+} PosNorm;
+
+enum{ MAX_VERTS = 36*20*20}
+static PosNorm vbo[MAX_VERTS];
+static vertsGenerated = 0;
+()
+{
+  cls(0);//Clear2D
+  glClear();
+  //fac = 8*mousx / xres;
+  static otim;
+  static float dir = 1;
+  float dt = klock() - otim;
+  otim = klock();
+  fac += dt * dir;
+  if (fac > 5) { dir = -1; fac = 5; }
+  if (fac <= 0) {dir = 1; fac = 0;}
+  glDepthFunc(GL_LESS);
+  //glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE);
+   glEnable(GL_DEPTH_TEST);
+   gluPerspective(30, xres/yres, 0.1, 1000.0);
+   rot = klock()*.5;
+
+     glTranslate(0,0,-8);
+     if (bstatus) {
+        glRotate((mousy/yres-.5)*240,1,0,0);
+        glRotate((mousx/xres-.5)*240,0,1,0);
+     } else {
+        glRotate(rot*90,0,1,0);
+        glRotate(rot*75,1,0,0);
+        glRotate(40,0,1,0);
+        glRotate(-25,1,0,0);
+     }
+   s = 0.5;
+   
+   vertsGenerated = 0;
+   
+   face(-s,0,0,subdivs);
+   face(+s,0,0,subdivs);
+   face(0,-s,0,subdivs);
+   face(0,+s,0,subdivs);
+   face(0,0,-s,subdivs);
+   face(0,0,+s,subdivs);
+   
+   glCullFace(GL_BACK);
+   //glCullFace(GL_NONE);
+   glUniform1i("tex0", 0);
+   glBegin(GL_TRIANGLES);
+   for(i=0; i<vertsGenerated; i++)
+   {
+     vec3 p = vbo[i].p;
+     vec3 n  = vbo[i].n;
+     vec3 c  = vbo[i].c;
+     vec2 t  = vbo[i].t;
+     glColor(c.x,c.y,c.z);
+     glNormal(n.x,n.y,n.z);
+     glTexCoord(t.x,t.y);
+     glVertex(p.x,p.y,p.z);
+   }
+   glEnd();
+   
+   moveto(15,15); printf("f=%.3f", fac);
+}
+
+vec3 lerp(vec3 a, vec3 b, float t){ 
+    return (1.0-t)*a + t*(b);
+}
+
+int glAddVertex(vec3 c, vec3 n, vec3 p, vec2 t)
+{
+  if (vertsGenerated > MAX_VERTS) return;
+  vbo[vertsGenerated].p = p;
+  vbo[vertsGenerated].n = n;
+  vbo[vertsGenerated].c = c;
+  vbo[vertsGenerated].t = t;
+  vertsGenerated++;
+}
+
+float clamp(x,lo,hi) { 
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+int face(int x, int y, int z, int n)
+{
+  s = 2 * (x + y + z);
+  vec3 faceNormal = normalize( vec3(x,y,z) );
+  vec3 col;
+  for(i=0; i<n; i++)
+  {
+    for(j=0; j<n; j++)
+    {
+      vec3 a,b,c,d;
+      float u0 = i / float(n);
+      float v0 = j / float(n);
+      float u1 = (i+1) / float(n);
+      float v1 = (j+1) / float(n);
+      float x0 = -.5*s+s * u0;
+      float y0 = -.5*s+s * v0;
+      float x1 = -.5*s+s * u1;
+      float y1 = -.5*s+s * v1;
+      
+      vec2 texcoords[4];
+      vec2 tex_scale = vec2(2,2); //vec2(1.0 / 4.0, 1.0 / 3.0);
+      vec2 tex_translate = vec2(0.0, 0.0);
+      int flip = 0;
+      
+      if (x < 0) { //afrika
+        a = vec3(x,x0,y0);
+        b = vec3(x,x0,y1);
+        c = vec3(x,x1,y1);
+        d = vec3(x,x1,y0);
+        col = vec3(1,0,0);
+        texcoords[0] = vec2(1-v0,1-u0);
+        texcoords[1] = vec2(1-v1,1-u0);
+        texcoords[2] = vec2(1-v1,1-u1);
+        texcoords[3] = vec2(1-v0,1-u1);
+        tex_translate = vec2(2*0.25, 1.0 / 3.0);
+      }
+      else if (x > 0) { //return; // right half of australia, papa nyguinea
+        a = vec3(x,x0,y0);
+        d = vec3(x,x0,y1);
+        c = vec3(x,x1,y1);
+        b = vec3(x,x1,y0);
+        col = vec3(0,1,0);
+        texcoords[0] = vec2(1-v0,u0);
+        texcoords[1] = vec2(1-v0,u1);
+        texcoords[2] = vec2(1-v1,u1);
+        texcoords[3] = vec2(1-v1,u0);
+        tex_translate = vec2(0.0, 1.0 / 3.0);
+      }
+      else if (y < 0) { //antarctica
+        a = vec3(x0,y,y0);
+        b = vec3(x1,y,y0);
+        c = vec3(x1,y,y1);
+        d = vec3(x0,y,y1);
+        col = vec3(0,0,1);
+        texcoords[0] = vec2(u0,v0);
+        texcoords[3] = vec2(u0,v1);
+        texcoords[2] = vec2(u1,v1);
+        texcoords[1] = vec2(u1,v0);
+        tex_translate = vec2(0.25, 0.0);
+      }
+      else if (y > 0) { // northern hemi
+        a = vec3(x0,y,y0);
+        b = vec3(x0,y,y1);
+        c = vec3(x1,y,y1);
+        d = vec3(x1,y,y0);
+        col = vec3(1,1,0);
+        texcoords[0] = vec2(1-u0,v0);
+        texcoords[1] = vec2(1-u0,v1);
+        texcoords[2] = vec2(1-u1,v1);
+        texcoords[3] = vec2(1-u1,v0);
+        tex_translate = vec2(0.25, 1.0 - 1/3);
+      } 
+      else if (z < 0) { //ameri
+        a = vec3(x0,y0,z);
+        b = vec3(x1,y0,z);
+        c = vec3(x1,y1,z);
+        d = vec3(x0,y1,z);
+        flip = 1;
+        col = vec3(1,0,1);
+        texcoords[0] = vec2(u0,1-v0);
+        texcoords[1] = vec2(u1,1-v0);
+        texcoords[2] = vec2(u1,1-v1);
+        texcoords[3] = vec2(u0,1-v1);
+        tex_translate = vec2(0.25, 1.0 / 3.0);
+      }
+      else if (z > 0) { //asia
+        a = vec3(x0,y0,z);
+        b = vec3(x1,y0,z);
+        c = vec3(x1,y1,z);
+        d = vec3(x0,y1,z);
+        col = vec3(0,1,1);
+        texcoords[0] = vec2(u0,v0);
+        texcoords[3] = vec2(u0,v1);
+        texcoords[2] = vec2(u1,v1);
+        texcoords[1] = vec2(u1,v0);
+        tex_translate = vec2(3*0.25, 1.0 / 3.0);
+      }
+      
+      vec3 na = normalize(a);
+      vec3 nb = normalize(b);
+      vec3 nc = normalize(c);
+      vec3 nd = normalize(d);
+      //float factor = 1.0;
+      a = lerp(na,a,fac);
+      b = lerp(nb,b,fac);
+      c = lerp(nc,c,fac);
+      d = lerp(nd,d,fac);
+
+      texcoords[0] *= tex_scale;
+      texcoords[1] *= tex_scale;
+      texcoords[2] *= tex_scale;
+      texcoords[3] *= tex_scale;
+      
+      texcoords[0] += tex_translate;
+      texcoords[1] += tex_translate;
+      texcoords[2] += tex_translate;
+      texcoords[3] += tex_translate;
+     // int flip=0;
+      if (flip==0)
+      {
+         //vec3 no = normalize( cross(b-a,c-a) );
+         //glNormal(no.x, no.y, no.z);
+         glAddVertex(col, na, a, texcoords[0]);
+         glAddVertex(col, nb, b, texcoords[1]);
+         glAddVertex(col, nc, c, texcoords[2]);
+         
+         //no = normalize( cross(d-c,a-c) );
+         //glNormal(no.x, no.y, no.z);
+         glAddVertex(col, nc, c, texcoords[2]);
+         glAddVertex(col, nd, d, texcoords[3]);
+         glAddVertex(col, na, a, texcoords[0]);
+      
+      } else {
+         glAddVertex(col, na, a, texcoords[0]);
+         glAddVertex(col, nc, c, texcoords[2]);
+         glAddVertex(col, nb, b, texcoords[1]);
+         
+         glAddVertex(col, nc, c, texcoords[2]);
+         glAddVertex(col, na, a, texcoords[0]);
+         glAddVertex(col, nd, d, texcoords[3]);
+      }
+    }
+  }
+}
+
+@v: // vertex shader start
+// no shader version declaration
+varying vec4 v, c, n, t, p;
+
+struct lightSource
+{
+  vec4 position;
+  vec4 diffuse;
+  vec4 specular;
+  float constantAttenuation, linearAttenuation, quadraticAttenuation;
+  float spotCutoff, spotExponent;
+  vec3 spotDirection;
+};
+lightSource light0 = lightSource(
+  vec4(1.0,  1.5,  5.0, 0.0),
+  vec4(1.0,  1.0,  1.0, 1.0),
+  vec4(1.0,  1.0,  1.0, 1.0),
+  0.0, 1.0, 0.0,
+  180.0, 0.0,
+  vec3(0.0, 0.0, 0.0)
+);
+vec4 scene_ambient = vec4(0.2, 0.2, 0.2, 1.0);
+
+struct material
+{
+  vec4 ambient;
+  vec4 diffuse;
+  vec4 specular;
+  float shininess;
+};
+material mymaterial = material(
+  vec4(0.4, 0.4, 0.4, 1.0),
+  vec4(1.0, 0.8, 0.8, 1.0),
+  vec4(1.0, 1.0, 1.0, 1.0),
+  20.0
+);
+
+void main()
+{
+   v = gl_Vertex;
+   c = vec4(gl_Color.xyz, 1.0);
+   t = gl_MultiTexCoord0;
+   n = vec4( gl_NormalMatrix * gl_Normal, 0.0 );
+   p = gl_ModelViewMatrix * v;
+
+   mat4 m = gl_ModelViewMatrix;
+   vec3 normalDirection = n.xyz;
+   vec3 viewDirection = normalize(vec3(gl_ModelViewMatrixInverse * vec4(0.0, 0.0, 0.0, 1.0) - m * v));
+   vec3 lightDirection;
+   float attenuation;
+
+  if (light0.position.w == 0.0) // directional light
+  {
+      attenuation = 1.0; // no attenuation
+      lightDirection = normalize(vec3(light0.position));
+  }
+  else // point or spot light (or other kind of light)
+  {
+      vec3 vertexToLightSource = vec3(light0.position - m * v);
+      float distance = length(vertexToLightSource);
+      lightDirection = normalize(vertexToLightSource);
+      attenuation = 1.0 / (light0.constantAttenuation
+			   + light0.linearAttenuation * distance
+			   + light0.quadraticAttenuation * distance * distance);
+
+      if (light0.spotCutoff <= 90.0) // spotlight
+	     {
+	      float clampedCosine = max(0.0, dot(-lightDirection, normalize(light0.spotDirection)));
+       attenuation = clampedCosine < cos(radians(light0.spotCutoff)) ? 
+                 0.0 : // outside of spotlight cone
+                 attenuation * pow(clampedCosine, light0.spotExponent);
+	     }
+  }
+  vec3 ambientLighting = vec3(scene_ambient) * vec3(mymaterial.ambient);
+  vec3 diffuseReflection = attenuation
+    * vec3(light0.diffuse) * gl_Color.xyz //vec3(mymaterial.diffuse)
+    * max(0.0, dot(normalDirection, lightDirection));
+
+  vec3 specularReflection;
+  if (dot(normalDirection, lightDirection) < 0.0) // light source on the wrong side?
+    {
+      specularReflection = vec3(0.0, 0.0, 0.0); // no specular reflection
+    }
+  else // light source on the right side
+    {
+      specularReflection = attenuation * vec3(light0.specular) * vec3(mymaterial.specular)
+	* pow(max(0.0, dot(reflect(-lightDirection, normalDirection), viewDirection)),
+	      mymaterial.shininess);
+    }
+  c = vec4(ambientLighting + diffuseReflection + specularReflection, 1.0);
+  //c = gl_Color;
+  gl_Position = gl_ProjectionMatrix * p;
+}
+
+@f: // fragment shader start
+// no shader version declaration
+varying vec4 c, t; // in GLSL ES 3.0 will be automatically in
+uniform sampler2D tex0;
+void main()
+{  
+  vec3 base = texture2D(tex0, t.xy).xyz;
+  vec3 diffuse = base * c.xyz;
+  gl_FragColor.xyz = diffuse.xyz;
+}
+

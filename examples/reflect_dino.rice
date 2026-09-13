@@ -1,0 +1,460 @@
+// Port of Mark Kilgard's reflectdino.c (1994/1997, the classic GLUT
+// "Leapin' Lizards" demo) to RiceScript - a stencil-masked planar
+// reflection. Ported specifically to exercise this compiler's new
+// glStencilFunc/glStencilOp/glStencilMask/GL_STENCIL_TEST support (see
+// kc_to_rice.md section 22 and rice_language_features.txt): without
+// stencil testing, the dinosaur's reflection "leaks" through to the
+// underside of the floor when the camera looks up from below; with it,
+// the reflection is correctly masked to only where the floor actually
+// is. Press SPACE to toggle stenciling on/off and see the difference
+// (matches the original's right-click "Toggle stenciling" menu entry -
+// simplified to a key since this compiler exposes no context menu API).
+// Drag with any mouse button held to orbit (original used left-button
+// drag specifically via GLUT's per-button callbacks; bstatus here is a
+// single "any button" flag, so that's simplified to "any button").
+//
+// Differences from the original, and why:
+//
+// - No GLU tessellator or display lists exist in this compiler,
+//   so makeDinosaur()'s extrudeSolidFromPolygon (concave 2D polygon ->
+//   extruded 3D solid via glNewList) is reimplemented from scratch: a
+//   general ear-clipping triangulator (triangulate() below) replaces
+//   GLU's tessellator for the two end caps, and glBeginMesh/glMesh
+//   (this compiler's closest equivalent to display lists) replaces
+//   glNewList/glCallList.
+// - No fixed-function lighting (glLightfv/glMaterialfv) exists either -
+//   WebGL has none - so lighting is a small custom vertex shader at the
+//   bottom of this file computing the same two lights (one positional
+//   green-tinted with GL-style constant+linear attenuation, one
+//   directional red-tinted) against a per-vertex base color baked in at
+//   mesh-record time (glColor4f standing in for glMaterialfv, since
+//   there's no separate material call). A uLit uniform switches the one
+//   shader between "lit" (dinosaur) and "flat passthrough" (floor,
+//   matching the original's glDisable(GL_LIGHTING) around drawFloor).
+// - No glFrontFace exists (only glCullFace), so every place the
+//   original flips front-face convention (the extrusion's end caps, and
+//   the floor's two-sided top/bottom pass) is instead done by literally
+//   reversing the vertex winding for that pass - same visual result.
+// - The side walls of each extruded solid are flat-shaded per edge
+//   (one glNormal per quad) rather than the original's smoothly
+//   interpolated per-column normals within a GL_QUAD_STRIP + GL_FLAT
+//   shademodel trick - simpler, and this compiler has no
+//   glShadeModel(GL_FLAT) to reproduce that trick exactly anyway.
+// - jump/idle animation and mouse drag are driven by klock()/mousx/
+//   mousy/bstatus (this environment's ambient input) instead of GLUT's
+//   idle/motion callbacks; angle math is identical.
+
+#option stencil 1
+
+enum {
+  MAXPTS  = 22,   // largest cross-section (body) vertex count
+  MAXTRIS = 60,   // (MAXPTS-2) triangles * 3 indices, upper bound
+
+  MESH_BODY = 0,
+  MESH_ARM  = 1,
+  MESH_LEG  = 2,
+  MESH_EYE  = 3
+};
+
+static double bodyWidth = 3.0;
+
+// Cross-section polygons, straight from reflectdino.c's body/arm/leg/eye
+// arrays, flattened to (x,y) pairs. Declared at a shared MAXPTS*2 size
+// (unused trailing slots are simply never read, since every call passes
+// the real point count alongside) so they all fit the one triangulate()/
+// buildSolid() signature below - this compiler requires an array
+// argument's declared size to match the parameter's exactly.
+static double bodyPts[MAXPTS*2] = {
+  0,3, 1,1, 5,1, 8,4, 10,4, 11,5, 11,11.5, 13,12, 13,13, 10,13.5, 13,14,
+  13,15, 11,16, 8,16, 7,15, 7,13, 8,12, 7,11, 6,6, 4,3, 3,2, 1,2
+};
+static double armPts[MAXPTS*2] = {
+  8,10, 9,9, 10,9, 13,8, 14,9, 16,9, 15,9.5, 16,10, 15,10, 15.5,11,
+  14.5,10, 14,11, 14,10, 13,9, 11,11, 9,11
+};
+static double legPts[MAXPTS*2] = {
+  8,6, 8,4, 9,3, 9,2, 8,1, 8,0.5, 9,0, 12,0, 10,1, 10,2, 12,4, 11,6, 10,7, 9,7
+};
+static double eyePts[MAXPTS*2] = {
+  8.75,15, 9,14.7, 9.6,14.7, 10.1,15, 9.6,15.25, 9,15.25
+};
+
+static int bodyCount = 22;
+static int armCount  = 16;
+static int legCount  = 14;
+static int eyeCount  = 6;
+
+static int uLitLoc;
+
+static double angle  = 20;   // degrees, orbit around Y
+static double angle2 = 30;   // degrees, orbit around X
+static double prevMousx;
+static double prevMousy;
+static int useStencil = 1;   // start with the fix enabled; SPACE toggles it
+static int prevSpace;
+
+// ---- ear-clipping triangulator (handles the concave cross-sections
+// GLU's tessellator handled in the original) ----
+
+static int idxBuf[MAXPTS];
+
+// Signed area * 2; positive if p winds CCW.
+signedArea2(double p[MAXPTS*2], int n)
+{
+  double a = 0;
+  for (int i=0; i<n; ++i) {
+    int j = (i+1) % n;
+    a += p[i*2] * p[j*2+1] - p[j*2] * p[i*2+1];
+  }
+  return a;
+}
+
+cross2(double ax, double ay, double bx, double by)
+{
+  return ax*by - ay*bx;
+}
+
+pointInTri(double qx, double qy, double ax, double ay, double bx, double by, double cx, double cy)
+{
+  double d1 = cross2(bx-ax, by-ay, qx-ax, qy-ay);
+  double d2 = cross2(cx-bx, cy-by, qx-bx, qy-by);
+  double d3 = cross2(ax-cx, ay-cy, qx-cx, qy-cy);
+  int hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+  int hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(hasNeg && hasPos);
+}
+
+// Triangulates polygon p (n verts, flat x,y pairs, simple - possibly
+// concave - non-self-intersecting) via ear-clipping. Writes (n-2)
+// triangles (3 point-indices each, indexing into p) to outTris and
+// returns the triangle count. Winding-agnostic: works whether p is
+// wound CW or CCW, and preserves that same winding in its output
+// triangles (each emitted triangle turns the same rotational direction
+// as the source polygon).
+int triangulate(double p[MAXPTS*2], int n, int outTris[MAXTRIS])
+{
+  for (int i=0; i<n; ++i) idxBuf[i] = i;
+  int remaining = n;
+  int ccw = (signedArea2(p, n) > 0);
+  int triCount = 0;
+  int guard = 0;
+  int guardMax = n*n + 8;
+
+  while (remaining > 3 && guard < guardMax) {
+    ++guard;
+    int earFound = 0;
+    for (int i=0; i<remaining && !earFound; ++i) {
+      int iPrev = (i - 1 + remaining) % remaining;
+      int iNext = (i + 1) % remaining;
+      int vPrev = idxBuf[iPrev];
+      int vCurr = idxBuf[i];
+      int vNext = idxBuf[iNext];
+
+      double ax = p[vPrev*2], ay = p[vPrev*2+1];
+      double bx = p[vCurr*2], by = p[vCurr*2+1];
+      double cx = p[vNext*2], cy = p[vNext*2+1];
+
+      double cr = cross2(bx-ax, by-ay, cx-bx, cy-by);
+      int convex = ccw ? (cr > 0) : (cr < 0);
+      if (!convex) continue;
+
+      int isEar = 1;
+      for (int k=0; k<remaining && isEar; ++k) {
+        if (k == iPrev || k == i || k == iNext) continue;
+        int vk = idxBuf[k];
+        if (pointInTri(p[vk*2], p[vk*2+1], ax, ay, bx, by, cx, cy)) isEar = 0;
+      }
+
+      if (isEar) {
+        outTris[triCount*3]   = vPrev;
+        outTris[triCount*3+1] = vCurr;
+        outTris[triCount*3+2] = vNext;
+        ++triCount;
+
+        for (int k=i; k<remaining-1; ++k) idxBuf[k] = idxBuf[k+1];
+        --remaining;
+        earFound = 1;
+      }
+    }
+    if (!earFound) break; // shouldn't happen for a simple polygon
+  }
+
+  if (remaining == 3) {
+    outTris[triCount*3]   = idxBuf[0];
+    outTris[triCount*3+1] = idxBuf[1];
+    outTris[triCount*3+2] = idxBuf[2];
+    ++triCount;
+  }
+
+  return triCount;
+}
+
+// Extrudes cross-section polygon p (n verts) by thickness along +Z into
+// mesh slot meshIndex: two triangulated end caps (at z=0 and
+// z=thickness, each single-sided facing outward) plus one outward-facing
+// quad per edge for the sides. Equivalent to extrudeSolidFromPolygon's
+// BODY_WHOLE/ARM_WHOLE/etc in the original, minus the separate
+// side/edge/whole display-list split (not needed here - GLU's
+// tessellator object was the only reason the original recorded the cap
+// separately from the edges).
+buildSolid(double p[MAXPTS*2], int n, double thickness, int meshIndex)
+{
+  int tris[MAXTRIS];
+  int triCount = triangulate(p, n, tris);
+  int ccw = (signedArea2(p, n) > 0);
+
+  glBeginMesh(meshIndex);
+
+  // End cap at z = thickness, normal +Z. Ear-clip triangles come out
+  // wound the same way as the source polygon; for a CCW polygon that
+  // means the (a,b,c) order already has a +Z-facing normal (verified:
+  // a CCW XY triangle's (b-a)x(c-b) points +Z) - so use it as-is here,
+  // and reversed for the opposite winding.
+  glBegin(GL_TRIANGLES);
+  glNormal(0, 0, 1);
+  for (int t=0; t<triCount; ++t) {
+    int i0 = tris[t*3], i1 = tris[t*3+1], i2 = tris[t*3+2];
+    if (ccw) {
+      glVertex(p[i0*2], p[i0*2+1], thickness);
+      glVertex(p[i1*2], p[i1*2+1], thickness);
+      glVertex(p[i2*2], p[i2*2+1], thickness);
+    } else {
+      glVertex(p[i0*2], p[i0*2+1], thickness);
+      glVertex(p[i2*2], p[i2*2+1], thickness);
+      glVertex(p[i1*2], p[i1*2+1], thickness);
+    }
+  }
+  glEnd();
+
+  // End cap at z = 0, normal -Z: same triangles, opposite winding choice.
+  glBegin(GL_TRIANGLES);
+  glNormal(0, 0, -1);
+  for (int t=0; t<triCount; ++t) {
+    int i0 = tris[t*3], i1 = tris[t*3+1], i2 = tris[t*3+2];
+    if (ccw) {
+      glVertex(p[i0*2], p[i0*2+1], 0);
+      glVertex(p[i2*2], p[i2*2+1], 0);
+      glVertex(p[i1*2], p[i1*2+1], 0);
+    } else {
+      glVertex(p[i0*2], p[i0*2+1], 0);
+      glVertex(p[i1*2], p[i1*2+1], 0);
+      glVertex(p[i2*2], p[i2*2+1], 0);
+    }
+  }
+  glEnd();
+
+  // Sides: one outward-facing quad per edge. Outward normal formula is
+  // reflectdino.c's own (dx = y1-y0, dy = x0-x1, normalized) - the
+  // vertex order below (both z=0 verts, then both z=thickness verts, in
+  // the same x,y order) is the one that makes that normal match the
+  // quad's actual winding (checked both symbolically and against a
+  // concrete unit-square edge).
+  glBegin(GL_QUADS);
+  for (int i=0; i<n; ++i) {
+    int j = (i+1) % n;
+    double x0 = p[i*2], y0 = p[i*2+1];
+    double x1 = p[j*2], y1 = p[j*2+1];
+    double dx = y1 - y0;
+    double dy = x0 - x1;
+    double len = sqrt(dx*dx + dy*dy);
+    glNormal(dx/len, dy/len, 0);
+    glVertex(x0, y0, 0);
+    glVertex(x1, y1, 0);
+    glVertex(x1, y1, thickness);
+    glVertex(x0, y0, thickness);
+  }
+  glEnd();
+
+  glEndMesh();
+}
+
+// "Material" color is baked into each mesh's vertices at record time via
+// glColor4f (standing in for the original's glMaterialfv(GL_FRONT,
+// GL_DIFFUSE, ...), since there's no separate material call here) - the
+// vertex shader multiplies this baked color by the lighting it computes.
+makeDinosaur()
+{
+  glColor(0.1, 1.0, 0.1, 1.0); // skinColor
+  buildSolid(bodyPts, bodyCount, bodyWidth, MESH_BODY);
+  buildSolid(armPts,  armCount,  bodyWidth / 4, MESH_ARM);
+  buildSolid(legPts,  legCount,  bodyWidth / 2, MESH_LEG);
+
+  glColor(1.0, 0.2, 0.2, 1.0); // eyeColor
+  buildSolid(eyePts,  eyeCount,  bodyWidth + 0.2, MESH_EYE);
+}
+
+drawDinosaur(double jump)
+{
+  glUniform1f(uLitLoc, 1);
+  glPushMatrix();
+  glTranslate(0, jump, 0);
+  glMesh(MESH_BODY);
+  glPushMatrix();
+    glTranslate(0, 0, bodyWidth);
+    glMesh(MESH_ARM);
+    glMesh(MESH_LEG);
+    glTranslate(0, 0, -bodyWidth - bodyWidth/4);
+    glMesh(MESH_ARM);
+    glTranslate(0, 0, -bodyWidth/4);
+    glMesh(MESH_LEG);
+    glTranslate(0, 0, bodyWidth/2 - 0.1);
+    glMesh(MESH_EYE);
+  glPopMatrix();
+  glPopMatrix();
+}
+
+// reversed=0: "top" orientation (normal +Y, visible from above).
+// reversed=1: "bottom" orientation (normal -Y, visible from below) -
+// stands in for the original's glFrontFace(GL_CW) toggle, which this
+// compiler has no equivalent for; reversing the vertex order gets the
+// same result.
+drawFloor(int reversed)
+{
+  glUniform1f(uLitLoc, 0);
+  glBegin(GL_QUADS);
+  if (!reversed) {
+    glVertex(-18, 0, 27);
+    glVertex(27, 0, 27);
+    glVertex(27, 0, -18);
+    glVertex(-18, 0, -18);
+  } else {
+    glVertex(-18, 0, -18);
+    glVertex(27, 0, -18);
+    glVertex(27, 0, 27);
+    glVertex(-18, 0, 27);
+  }
+  glEnd();
+}
+
+()
+{
+  if (numframes == 0) {
+    glCullFace(GL_BACK);
+    glEnable(GL_DEPTH_TEST);
+
+    uLitLoc = glGetUniformLoc("uLit");
+    makeDinosaur();
+  }
+
+  double t = klock() * 2;
+  double jump = 3 * abs(sin(t));
+
+  if (bstatus) {
+    angle  += (mousx - prevMousx) * 0.5;
+    angle2 += (mousy - prevMousy) * 0.5;
+  }
+  prevMousx = mousx;
+  prevMousy = mousy;
+
+  int spacePressed = keystatus[KEY_SPACE] && !prevSpace;
+  prevSpace = int(keystatus[KEY_SPACE]);
+  if (spacePressed) useStencil = 1 - useStencil;
+
+  glLoadIdentity();
+  gluLookAt(0, 0, 40, 0, 0, 0, 0, 1, 0);
+  gluPerspective(40, xres / yres, 1, 80);
+
+  if (useStencil) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+  } else {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  }
+
+  glPushMatrix();
+    glRotate(angle2, 1, 0, 0);
+    glRotate(angle, 0, 1, 0);
+    glTranslate(-8, -8, -bodyWidth / 2);
+
+    if (useStencil) {
+      // Draw 1 into the stencil buffer everywhere the floor is, without
+      // touching color or depth. Back-face culling (still enabled) means
+      // this single-sided "top" quad only rasterizes - and so only sets
+      // stencil - when the floor's top is actually facing the camera;
+      // viewed from below, nothing gets stencilled, so the EQUAL test
+      // below rejects the whole reflection instead of showing a bogus
+      // upside-down dinosaur. That's the entire trick.
+      glDisable(GL_DEPTH_TEST);
+      glColorMask(0, 0, 0, 0);
+      glEnable(GL_STENCIL_TEST);
+      glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE);
+      glStencilFunc(GL_ALWAYS, 1, 0xffffffff);
+      drawFloor(0);
+      glColorMask(1, 1, 1, 1);
+      glEnable(GL_DEPTH_TEST);
+      glStencilFunc(GL_EQUAL, 1, 0xffffffff);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
+
+    glPushMatrix();
+      glScale(1, -1, 1);
+      glCullFace(GL_FRONT); // winding flips under the mirror scale
+      drawDinosaur(jump);
+      glCullFace(GL_BACK);
+    glPopMatrix();
+
+    if (useStencil) glDisable(GL_STENCIL_TEST);
+
+    // "Top" of floor: reflective-looking translucent red, blended over
+    // the reflection drawn above.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor(0.7, 0.0, 0.0, 0.3);
+    drawFloor(0);
+    glDisable(GL_BLEND);
+
+    // "Bottom" of floor: opaque blue, visible only from underneath.
+    glColor(0.1, 0.1, 0.7, 1.0);
+    drawFloor(1);
+
+    drawDinosaur(jump);
+  glPopMatrix();
+
+  glUniform1f(uLitLoc, 0);
+  setcol(255, 255, 255);
+  moveto(10, yres - 20);
+  if (useStencil) printf("Stencil ON (SPACE to toggle) - drag to orbit, look from below");
+  else printf("Stencil OFF (SPACE to toggle) - look from below to see the bogus dinosaur");
+}
+
+@v
+uniform float uLit;
+varying vec4 vColor;
+void main()
+{
+  vec4 posEye = gl_ModelViewMatrix * gl_Vertex;
+  gl_Position = gl_ProjectionMatrix * posEye;
+
+  if (uLit > 0.5)
+  {
+    vec3 N = normalize(gl_NormalMatrix * gl_Normal);
+
+    // Light 0: green-tinted positional light (lightZeroPosition/-Color
+    // in the original), with the same constant+linear attenuation.
+    vec3 light0Eye = (gl_ModelViewMatrix * vec4(10.0, 14.0, 10.0, 1.0)).xyz;
+    vec3 toLight0 = light0Eye - posEye.xyz;
+    float dist0 = length(toLight0);
+    vec3 L0 = toLight0 / max(dist0, 0.0001);
+    float atten0 = 1.0 / (0.1 + 0.05 * dist0);
+    float diff0 = max(dot(N, L0), 0.0) * atten0;
+
+    // Light 1: red-tinted directional light (lightOnePosition w=0).
+    vec3 L1 = normalize(gl_NormalMatrix * vec3(-1.0, 1.0, 1.0));
+    float diff1 = max(dot(N, L1), 0.0);
+
+    vec3 lit = gl_Color.rgb * (vec3(0.2, 0.2, 0.2)
+             + vec3(0.8, 1.0, 0.8) * diff0
+             + vec3(0.6, 0.3, 0.2) * diff1);
+    vColor = vec4(lit, gl_Color.a);
+  }
+  else
+  {
+    vColor = gl_Color;
+  }
+}
+
+@f
+varying vec4 vColor;
+void main()
+{
+  gl_FragColor = vColor;
+}

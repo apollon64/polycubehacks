@@ -1,0 +1,225 @@
+// Shadow-mapping sketch: a ground plane + a cube, lit by a point light that
+// orbits overhead, casting a real depth-texture shadow from the cube onto
+// the ground. Classic two-pass depth-texture shadow mapping, not stencil
+// shadow volumes -- depth-texture shadow mapping is the better fit for
+// real-time shadows regardless (see kc_to_rice.md section 22 for the
+// compiler's stencil support, added later for stencil-masking techniques
+// like planar reflections, not shadow volumes specifically).
+//
+// Deliberately kept simpler than a from-scratch alternative also in this
+// directory: single cube instead of procedural geometry, one flat ground
+// plane, no per-pixel lighting beyond the shadow term itself.
+//
+// One thing found while building this, worth knowing if you extend it:
+// glSetShader does not take effect when it SWITCHES AWAY from a shader
+// that's already active -- confirmed with a clean 3-way test on a known-
+// good compiler build: (1) glQuad() with only one glSetShader call ever
+// made works fine; (2) glQuad() with a second glSetShader call switching
+// programs mid-frame keeps rendering the FIRST shader's output, by index
+// or by name; (3) glBegin/glVertex/glEnd with the same switch gives the
+// identical result -- also stuck on the first shader (this superseded an
+// earlier, wrong note here claiming immediate-mode drawing respects
+// switching; that was never actually tested with two different shaders
+// until this follow-up). Set a shader once and never switch away from it.
+// Sidestepped here by using a SINGLE shader program for both the
+// shadow-depth pass and the lit main pass, branching in the fragment
+// shader on a uPassMode uniform instead of switching programs -- the
+// correct pattern for any multi-pass technique in this compiler, not
+// just a workaround. See rice_language_features.txt and kc_to_rice.md
+// (section 18) for the full writeup.
+//
+// Depth is packed into two 8-bit color channels (16-bit effective
+// precision -- plenty for a 256x256 shadow map at this scale) since this
+// compiler's capture targets are plain RGBA color textures, not real
+// depth textures.
+
+#use glsl_math
+
+enum {
+  SHADOW_SIZE = 256,
+  SHADOW_TEX = 0,
+  DUMMY_TEX = 1  // see "feedback loop" note below
+};
+
+static double lightView[16];
+static double lightProj[16];
+
+static int uPassModeLoc;
+static int uShadowMapLoc;
+static int uBaseColorLoc;
+static int uLightViewLoc;
+static int uLightProjLoc;
+
+()
+{
+  if (numframes == 0) {
+    glCaptureTex(SHADOW_TEX, SHADOW_SIZE, SHADOW_SIZE, GL_DEPTH_BUFFER_BIT);
+    glCaptureTex(DUMMY_TEX, 1, 1);
+    glCullFace(GL_NONE);
+
+    uPassModeLoc  = glGetUniformLoc("uPassMode");
+    uShadowMapLoc = glGetUniformLoc("uShadowMap");
+    uBaseColorLoc = glGetUniformLoc("uBaseColor");
+    uLightViewLoc = glGetUniformLoc("uLightView");
+    uLightProjLoc = glGetUniformLoc("uLightProj");
+  }
+
+  double t = klock();
+  double lightAngle = t * 0.5;
+  double lightX = 3.5 * cos(lightAngle);
+  double lightZ = 3.5 * sin(lightAngle);
+  double lightY = 4.5;
+
+  // --- Pass 1: render depth from the light's point of view into SHADOW_TEX ---
+  // Rebind texture unit 0 away from SHADOW_TEX first: Pass 2 (below) leaves it
+  // bound there as the shadow-map sampler, and rendering INTO SHADOW_TEX while
+  // it's still bound as an input on the active program is a real feedback loop
+  // -- confirmed via chromium's own console (GL_INVALID_OPERATION: "Feedback
+  // loop formed between Framebuffer and active Texture"), which silently
+  // no-ops every draw call in Pass 1 from the 2nd frame onward, leaving the
+  // shadow map stuck at its cleared "far" value forever (no shadow ever
+  // renders). Symptom without this line: the demo looks fine on frame 0 (the
+  // texture was never bound yet) then the shadow silently vanishes.
+  glActiveTexture(0);
+  glBindTex(0, DUMMY_TEX);
+
+  glLoadIdentity();
+  gluLookAt(lightX, lightY, lightZ, 0, 0.6, 0, 0, 1, 0);
+  glGetMatrix(lightView);
+
+  glCaptureBegin(SHADOW_TEX);
+  // MUST come after glCaptureBegin, not before: glCaptureBegin pushes its
+  // own auto-generated projection matrix (from curr_fovy, with a hardcoded
+  // far=1000) onto the projection stack, silently overriding any
+  // gluPerspective/glOrtho set up beforehand. Getting this order backwards
+  // means uLightProj (what the main pass uses to compute shadowCoord.z)
+  // never matches the projection that actually produced gl_FragCoord.z
+  // during this shadow pass -- the two numbers end up in unrelated scales,
+  // so the shadow comparison silently never triggers anywhere in the frame
+  // (confirmed by a full-frame grid-scan readback while tracking this down).
+  gluPerspective(70, 1.0, 1.0, 14.0);
+  glGetProjectionMatrix(lightProj);
+  glEnable(GL_DEPTH_TEST);
+  glClearColor(1, 1, 1, 1);
+  glClear();
+
+  glUniform1f(uPassModeLoc, 0);
+  glUniformMatrix4fv(uLightViewLoc, lightView);
+  glUniformMatrix4fv(uLightProjLoc, lightProj);
+
+  drawScene();
+
+  glCaptureEnd();
+
+  // --- Pass 2: render the real view, sampling the shadow map ---
+  glClearColor(0.05, 0.05, 0.12, 1);
+  glClear();
+  glEnable(GL_DEPTH_TEST);
+
+  glLoadIdentity();
+  gluLookAt(4, 3.2, 6, 0, 0.7, 0, 0, 1, 0);
+  gluPerspective(55, xres / yres, 0.1, 50);
+
+  glActiveTexture(0);
+  glBindTex(0, SHADOW_TEX);
+  glUniform1i(uShadowMapLoc, 0);
+  glUniform1f(uPassModeLoc, 1);
+  glUniformMatrix4fv(uLightViewLoc, lightView);
+  glUniformMatrix4fv(uLightProjLoc, lightProj);
+
+  drawScene();
+
+  setcol(255, 255, 255);
+  moveto(10, yres - 20);
+  printf("Simple Shadow Mapping Demo (cube caster)");
+}
+
+drawScene()
+{
+  glUniform3f(uBaseColorLoc, 0.75, 0.75, 0.8);
+  drawGround();
+
+  glUniform3f(uBaseColorLoc, 0.9, 0.35, 0.2);
+  drawCube();
+}
+
+drawGround()
+{
+  glBegin(GL_QUADS);
+  glVertex(-3, 0, -3);
+  glVertex(3, 0, -3);
+  glVertex(3, 0, 3);
+  glVertex(-3, 0, 3);
+  glEnd();
+}
+
+drawCube()
+{
+  glBegin(GL_QUADS);
+  // top
+  glVertex(-0.5, 1.5, -0.5); glVertex(0.5, 1.5, -0.5); glVertex(0.5, 1.5, 0.5); glVertex(-0.5, 1.5, 0.5);
+  // bottom
+  glVertex(-0.5, 0.5, -0.5); glVertex(-0.5, 0.5, 0.5); glVertex(0.5, 0.5, 0.5); glVertex(0.5, 0.5, -0.5);
+  // front (+z)
+  glVertex(-0.5, 0.5, 0.5); glVertex(0.5, 0.5, 0.5); glVertex(0.5, 1.5, 0.5); glVertex(-0.5, 1.5, 0.5);
+  // back (-z)
+  glVertex(0.5, 0.5, -0.5); glVertex(-0.5, 0.5, -0.5); glVertex(-0.5, 1.5, -0.5); glVertex(0.5, 1.5, -0.5);
+  // left (-x)
+  glVertex(-0.5, 0.5, -0.5); glVertex(-0.5, 0.5, 0.5); glVertex(-0.5, 1.5, 0.5); glVertex(-0.5, 1.5, -0.5);
+  // right (+x)
+  glVertex(0.5, 0.5, 0.5); glVertex(0.5, 0.5, -0.5); glVertex(0.5, 1.5, -0.5); glVertex(0.5, 1.5, 0.5);
+  glEnd();
+}
+
+@v:sceneShader
+varying vec4 vLightSpacePos;
+uniform mat4 uLightView;
+uniform mat4 uLightProj;
+void main()
+{
+  vLightSpacePos = uLightProj * uLightView * gl_Vertex;
+  gl_Position = gl_ProjectionMatrix * gl_ModelViewMatrix * gl_Vertex;
+}
+
+@f:sceneShader
+varying vec4 vLightSpacePos;
+uniform sampler2D uShadowMap;
+uniform float uPassMode;
+uniform vec3 uBaseColor;
+
+vec4 packDepth(float v)
+{
+  float scaled = v * 65535.0;
+  float hi = floor(scaled / 256.0);
+  float lo = scaled - hi * 256.0;
+  return vec4(hi / 255.0, lo / 255.0, 0.0, 1.0);
+}
+
+float unpackDepth(vec4 rgba)
+{
+  float hi = rgba.r * 255.0;
+  float lo = rgba.g * 255.0;
+  return (hi * 256.0 + lo) / 65535.0;
+}
+
+void main()
+{
+  if (uPassMode < 0.5)
+  {
+    gl_FragColor = packDepth(gl_FragCoord.z);
+  }
+  else
+  {
+    vec3 shadowCoord = vLightSpacePos.xyz / vLightSpacePos.w * 0.5 + 0.5;
+    float lit = 1.0;
+    if (shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 &&
+        shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0 &&
+        shadowCoord.z >= 0.0 && shadowCoord.z <= 1.0)
+    {
+      float shadowDepth = unpackDepth(texture2D(uShadowMap, shadowCoord.xy));
+      float bias = 0.0015;
+      if (shadowCoord.z - bias > shadowDepth) lit = 0.35;
+    }
+    gl_FragColor = vec4(uBaseColor * lit, 1.0);
+  }
+}

@@ -9,7 +9,6 @@ It includes some new functionality I wanted:
 * some more error messages, such as not allowing int foo = 3.14 without a cast.
 * operators << and >> for ints.
 * warning on implicit conversion to-from int/double.
-
-TODO
 * Functions returning a value indexed by a global/static array require storing the value in a temp before return.
   ex, static vec3 color[MAX_C] = {...}; vec3 getColor(i) { vec3 tmp=color[i]; return t; }
+* add glStencil{Func,Op,Mask} functions and GL_STENCIL_TEST

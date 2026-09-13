@@ -1,0 +1,344 @@
+// Simple shadow mapping demo.
+//
+// Classic two-pass shadow mapping: render scene depth from the light's
+// point of view into a captured RGBA texture (depth packed into the 4
+// bytes, since there is no depth-texture readback in this build - see
+// kc_to_rice.md), then render the scene from the camera, transforming
+// each fragment into light space and comparing its depth against the
+// stored value to decide whether it's occluded from the light.
+//
+// Scene is kept deliberately simple: a flat floor plane + one cube
+// sitting on it. All geometry is emitted directly in WORLD-SPACE
+// coordinates (no glTranslate/glRotate on the objects themselves, only
+// gluLookAt/gluPerspective for the camera and light) so gl_Vertex IS
+// the world position in every shader, and gl_Normal IS the world-space
+// normal (since nothing rotates the objects) - this sidesteps needing
+// a separate per-object model matrix entirely.
+//
+// The light orbits slowly overhead so the shadow visibly sweeps around
+// the cube on the floor.
+#use glsl_math
+
+enum { SHADOW_TEX = 0 };
+enum { SHADOW_SIZE = 1024 };
+enum { SPONGE_MESH = 0 };
+enum { SPONGE_LEVEL = 3 }; // "M3" - 20^3 = 8000 leaf cubes
+
+static double lightProjArr[16];
+static double lightViewArr[16];
+
+drawFloor()
+{
+    glNormal(0, 1, 0);
+    glBegin(GL_QUADS);
+      glVertex(-6, 0, -6);
+      glVertex( 6, 0, -6);
+      glVertex( 6, 0,  6);
+      glVertex(-6, 0,  6);
+    glEnd();
+}
+
+// Is 3x3x3 grid cell (i,j,k), each in {-1,0,1}, kept by the standard Menger
+// removal rule (drop the body-center cube and the 6 face-center cubes -
+// i.e. drop any cell with at least 2 of its 3 coords equal to 0)? Also used
+// to test a neighbor cell one step outside the current 3x3x3 block, which
+// simply doesn't exist (returns false) so that side's face never gets
+// culled - it may still be hidden by a same-parent sibling one level up,
+// but this demo only culls within one level, same as the tradeoff already
+// documented in menger_sponge.rice.
+cellExists(i, j, k)
+{
+    if (i < -1 || i > 1 || j < -1 || j > 1 || k < -1 || k > 1) return 0;
+    zeros = 0;
+    if (i == 0) zeros++;
+    if (j == 0) zeros++;
+    if (k == 0) zeros++;
+    return zeros < 2;
+}
+
+// faceSkip indices: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z.
+drawSpongeLeaf(vec3 center, size, faceSkip[6])
+{
+    h = size * 0.5;
+    x = center.x; y = center.y; z = center.z;
+
+    if (!faceSkip[1]) { // +X
+      glNormal(1, 0, 0);
+      glVertex(x + h, y - h, z - h);
+      glVertex(x + h, y + h, z - h);
+      glVertex(x + h, y + h, z + h);
+      glVertex(x + h, y - h, z + h);
+    }
+    if (!faceSkip[0]) { // -X
+      glNormal(-1, 0, 0);
+      glVertex(x - h, y - h, z - h);
+      glVertex(x - h, y - h, z + h);
+      glVertex(x - h, y + h, z + h);
+      glVertex(x - h, y + h, z - h);
+    }
+    if (!faceSkip[3]) { // +Y
+      glNormal(0, 1, 0);
+      glVertex(x - h, y + h, z - h);
+      glVertex(x - h, y + h, z + h);
+      glVertex(x + h, y + h, z + h);
+      glVertex(x + h, y + h, z - h);
+    }
+    if (!faceSkip[2]) { // -Y
+      glNormal(0, -1, 0);
+      glVertex(x - h, y - h, z - h);
+      glVertex(x + h, y - h, z - h);
+      glVertex(x + h, y - h, z + h);
+      glVertex(x - h, y - h, z + h);
+    }
+    if (!faceSkip[5]) { // +Z
+      glNormal(0, 0, 1);
+      glVertex(x - h, y - h, z + h);
+      glVertex(x + h, y - h, z + h);
+      glVertex(x + h, y + h, z + h);
+      glVertex(x - h, y + h, z + h);
+    }
+    if (!faceSkip[4]) { // -Z
+      glNormal(0, 0, -1);
+      glVertex(x - h, y - h, z - h);
+      glVertex(x - h, y + h, z - h);
+      glVertex(x + h, y + h, z - h);
+      glVertex(x + h, y - h, z - h);
+    }
+}
+
+// Standard Menger sponge recursion: subdivide into a 3x3x3 grid, drop the
+// body-center + 6 face-centers (20 children remain), recurse until level
+// hits 0. faceSkip lets a child skip the face it shares with an existing
+// same-parent sibling (that face is interior and would never be seen).
+mengerSponge(vec3 center, size, level, faceSkip[6])
+{
+    if (level <= 0)
+    {
+        drawSpongeLeaf(center, size, faceSkip);
+        return;
+    }
+
+    childSize = size / 3.0;
+    for (i = -1; i <= 1; i++)
+    for (j = -1; j <= 1; j++)
+    for (k = -1; k <= 1; k++)
+    {
+        if (!cellExists(i, j, k)) continue;
+
+        vec3 childCenter = center + vec3(i, j, k) * childSize;
+
+        double childSkip[6];
+        childSkip[0] = cellExists(i - 1, j, k); // -X
+        childSkip[1] = cellExists(i + 1, j, k); // +X
+        childSkip[2] = cellExists(i, j - 1, k); // -Y
+        childSkip[3] = cellExists(i, j + 1, k); // +Y
+        childSkip[4] = cellExists(i, j, k - 1); // -Z
+        childSkip[5] = cellExists(i, j, k + 1); // +Z
+
+        mengerSponge(childCenter, childSize, level - 1, childSkip);
+    }
+}
+
+static vec3 camPos;
+static camHorizAngle;
+static camVertiAngle;
+()
+{
+if (numframes == 0)
+   {
+      camPos = vec3(0, 5, -12);
+      camHorizAngle = pi;// faces the sponge at the origin from here
+      camVertiAngle = 0;
+   }
+    if (numframes == 0)
+    {
+        glCaptureTex(SHADOW_TEX, SHADOW_SIZE, SHADOW_SIZE, GL_RGBA | GL_CLAMP_TO_EDGE | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glCullFace(GL_NONE);
+
+        // Bake the sponge once - it's static geometry, and at level 3 (8000
+        // leaf cubes) redoing this recursion with immediate-mode glVertex
+        // calls twice a frame (shadow pass + main pass) would be wasteful.
+        double rootSkip[6]; // root never reaches a leaf directly, unused
+        glBeginMesh(SPONGE_MESH);
+          glBegin(GL_QUADS);
+            mengerSponge(vec3(0, 1, 0), 2.0, SPONGE_LEVEL, rootSkip);
+          glEnd();
+        glEndMesh();
+    }
+
+    double angle = klock() * 0.3;
+    double lightX = 6.0 * cos(angle);
+    double lightZ = 6.0 * sin(angle);
+    double lightY = 7.0;
+    double lightLen = sqrt(lightX*lightX + lightY*lightY + lightZ*lightZ);
+    double lightDirX = lightX / lightLen;
+    double lightDirY = lightY / lightLen;
+    double lightDirZ = lightZ / lightLen;
+
+    // ---- Pass 1: render depth from the light's point of view ----
+    glCaptureBegin(SHADOW_TEX);
+    glClearColor(1, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glOrtho(-9, 9, -9, 9, 1, 20);
+    gluLookAt(lightX, lightY, lightZ, 0, 0, 0, 0, 1, 0);
+    glGetProjectionMatrix(lightProjArr);
+    glGetMatrix(lightViewArr);
+    glSetShader(0, 0);
+    drawFloor();
+    glMesh(SPONGE_MESH);
+    glCaptureEnd();
+
+    // ---- Pass 2: render the scene from the camera ----
+    glClearColor(0.05, 0.07, 0.10, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    playercontrols();
+
+    gluPerspective(60, double(xres) / double(yres), 0.1, 100.0);
+    vec3 forward = vec3(-cos(camVertiAngle)*sin(camHorizAngle), sin(camVertiAngle), -cos(camVertiAngle)*cos(camHorizAngle));
+    vec3 target = camPos + forward;
+    gluLookAt(camPos.x, camPos.y, camPos.z, target.x, target.y, target.z, 0, 1, 0);
+    
+    glSetShader(1, 1);
+
+    int locLightProj = glGetUniformLoc("lightProj");
+    int locLightView = glGetUniformLoc("lightView");
+    glUniformMatrix4fv(locLightProj, lightProjArr);
+    glUniformMatrix4fv(locLightView, lightViewArr);
+
+    int locLightDir = glGetUniformLoc("lightDir");
+    glUniform3f(locLightDir, lightDirX, lightDirY, lightDirZ);
+
+    glActiveTexture(1);
+    glBindTex(1, SHADOW_TEX);
+    int locShadowMap = glGetUniformLoc("shadowMap");
+    glUniform1i(locShadowMap, 1);
+
+    int locBaseColor = glGetUniformLoc("baseColor");
+    glUniform3f(locBaseColor, 0.55, 0.58, 0.62);
+    drawFloor();
+    glUniform3f(locBaseColor, 0.75, 0.35, 0.25);
+    glMesh(SPONGE_MESH);
+
+    setcol(255, 255, 255);
+    moveto(10, yres - 20);
+    printf("Simple Shadow Mapping Demo");
+}
+
+// playercontrols() drives camPos/camHorizAngle/camVertiAngle from
+// WASD + mouse-drag look; the main loop turns that into the actual GL
+// camera each frame via gluPerspective/gluLookAt.
+playercontrols()
+{
+   static oldMouseX;
+   static oldMouseY;
+
+   f = 0.1;
+   if (keystatus[0x2a]) f /= 4; // shift: slow
+   if (keystatus[0x36]) f *= 4; // ctrl: fast
+   vx = (keystatus[32] - keystatus[30]) * f; // D - A
+   vy = (keystatus[17] - keystatus[31]) * f; // W - S
+
+   // right/forward must match the gluLookAt forward vector in the main
+   // loop (see the coordinate-system note at the top of this file) or
+   // WASD would strafe/walk sideways relative to where the camera is
+   // actually looking.
+   rightX = cos(camHorizAngle);
+   rightZ = -sin(camHorizAngle);
+   forwardX = -cos(camVertiAngle) * sin(camHorizAngle);
+   forwardY = sin(camVertiAngle);
+   forwardZ = -cos(camVertiAngle) * cos(camHorizAngle);
+
+   camPos.x += rightX * vx + forwardX * vy;
+   camPos.y += forwardY * vy;
+   camPos.z += rightZ * vx + forwardZ * vy;
+
+   mouseSpeedX = (mousx - oldMouseX) * 0.01;
+   mouseSpeedY = (mousy - oldMouseY) * 0.01;
+   oldMouseX = mousx;
+   oldMouseY = mousy;
+   if (bstatus == 1)
+   {
+      camHorizAngle -= mouseSpeedX;
+      camVertiAngle -= mouseSpeedY;
+   }
+}
+
+@v
+// Shadow pass: only depth matters, written by the fragment shader from
+// gl_FragCoord.z (already the standard post-viewport [0,1] depth value,
+// correct regardless of ortho/perspective).
+void main()
+{
+    gl_Position = ftransform();
+}
+
+@f
+vec4 packDepth(float depth)
+{
+    vec4 bitShift = vec4(256.0*256.0*256.0, 256.0*256.0, 256.0, 1.0);
+    vec4 bitMask = vec4(0.0, 1.0/256.0, 1.0/256.0, 1.0/256.0);
+    vec4 res = fract(depth * bitShift);
+    res -= res.xxyz * bitMask;
+    return res;
+}
+void main()
+{
+    gl_FragColor = packDepth(gl_FragCoord.z);
+}
+
+@v
+// Main pass: forwards world-space position/normal (gl_Vertex/gl_Normal
+// are already world-space here, since scene objects are never rotated
+// or scaled - only the camera's gluLookAt touches the modelview matrix)
+// plus the light-space position used for the shadow-map lookup.
+uniform mat4 lightProj;
+uniform mat4 lightView;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec4 vLightSpacePos;
+void main()
+{
+    vWorldPos = gl_Vertex.xyz;
+    vNormal = gl_Normal;
+    vLightSpacePos = lightProj * lightView * vec4(vWorldPos, 1.0);
+    gl_Position = ftransform();
+}
+
+@f
+uniform sampler2D shadowMap;
+uniform vec3 lightDir;
+uniform vec3 baseColor;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec4 vLightSpacePos;
+
+float unpackDepth(vec4 rgba)
+{
+    vec4 bitShift = vec4(1.0/(256.0*256.0*256.0), 1.0/(256.0*256.0), 1.0/256.0, 1.0);
+    return dot(rgba, bitShift);
+}
+
+void main()
+{
+    vec3 n = normalize(vNormal);
+    vec3 l = normalize(lightDir);
+    float ndotl = max(dot(n, l), 0.0);
+
+    vec3 shadowCoord = vLightSpacePos.xyz / vLightSpacePos.w;
+    shadowCoord = shadowCoord * 0.5 + 0.5;
+
+    float shadow = 1.0;
+    if (shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 &&
+        shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0 &&
+        shadowCoord.z >= 0.0 && shadowCoord.z <= 1.0)
+    {
+        float storedDepth = unpackDepth(texture2D(shadowMap, shadowCoord.xy));
+        float bias = 0.0025;
+        if (shadowCoord.z - bias > storedDepth) shadow = 0.35;
+    }
+
+    vec3 color = baseColor * (0.25 + 0.75 * ndotl * shadow);
+    gl_FragColor = vec4(color, 1.0);
+}
+

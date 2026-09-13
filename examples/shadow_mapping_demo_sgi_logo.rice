@@ -1,0 +1,1053 @@
+// Shadow mapping + chrome environment mapping demo, in the spirit of SGI's
+// classic "shiny logo" reel: a chrome sculpture sitting on a flat floor,
+// lit by a single light that orbits overhead. The logo's material is a
+// real dynamic reflection (a baked environment cubemap sampled via
+// reflect()/textureCube in its fragment shader, exactly the trick that
+// demo was originally showing off), plus it still casts a soft shadow
+// onto the floor via classic two-pass shadow mapping.
+//
+// Classic two-pass shadow mapping: render scene depth from the light's
+// point of view into a captured RGBA texture (depth packed into the 4
+// bytes, since there is no depth-texture readback in this build - see
+// kc_to_rice.md), then render the scene from the camera, transforming
+// each fragment into light space and comparing its depth against the
+// stored value to decide whether it's occluded from the light.
+//
+// Scene is kept deliberately simple: a flat floor plane + one chrome
+// logo sculpture standing on it. All geometry is emitted directly in
+// WORLD-SPACE coordinates (no glTranslate/glRotate on the objects
+// themselves, only gluLookAt/gluPerspective for the camera and light) so
+// gl_Vertex IS the world position in every shader, and gl_Normal IS the
+// world-space normal (since nothing rotates the objects) - this
+// sidesteps needing a separate per-object model matrix entirely.
+//
+// The light orbits slowly overhead so both the shadow and the chrome's
+// specular highlight visibly sweep around the logo.
+#use glsl_math
+
+enum { SHADOW_TEX = 0 };
+enum { SHADOW_SIZE = 1024 };
+enum { ENV_TEX = 1 };
+enum { ENV_SIZE = 64 };
+// NOTE: texture indices 0 and 1 are already the shadow map and env
+// cubemap render targets above, so the wall textures live at 2 and 3
+// instead of glSetTex(0)/glSetTex(1) - those slots would otherwise
+// collide with glCaptureTex(SHADOW_TEX,...)/glCaptureTexCube(ENV_TEX,...).
+enum { WALL_TEX_SQUARES = 2 };
+enum { WALL_TEX_CIRCLES = 3 };
+enum { WALL_TEX_SIZE = 128 };
+enum { SKY_TEX = 4 };
+enum { SKY_SIZE = 256 };
+// The sky (and, since it samples the sky as its backdrop, the env
+// cubemap too) is re-baked every SKY_REBAKE_INTERVAL frames rather than
+// every frame, so the sun glow can track the orbiting light without
+// paying for two extra 6-face renders each frame. 10 is a compromise
+// between visibly-smooth motion and bake cost; set to 1 to re-bake every
+// frame (most accurate, most expensive), or raise it for a cheaper/more
+// stepped sweep.
+enum { SKY_REBAKE_INTERVAL = 6 };
+// Optional small marker sphere drawn at the light's actual position each
+// frame, so you can see what the sky's glow/the shadow/the specular
+// highlight are all tracking. Set to 0 to hide it.
+enum { SHOW_LIGHT_PROXY = 0 };
+enum { LOGO_MESH = 0 };
+
+static double lightProjArr[16];
+static double lightViewArr[16];
+
+drawFloor()
+{
+    glNormal(0, 1, 0);
+    glBegin(GL_QUADS);
+      glVertex(-6, 0, -6);
+      glVertex( 6, 0, -6);
+      glVertex( 6, 0,  6);
+      glVertex(-6, 0,  6);
+    glEnd();
+}
+
+// Back-left corner walls, textured and reflected in the chrome logo's
+// environment map. Texture coordinates repeat the pattern 3x across each
+// wall (GL_REPEAT is the default wrap mode) rather than stretching one
+// copy over the whole surface.
+drawWallSquares()
+{
+    glNormal(1, 0, 0);
+    glBegin(GL_QUADS);
+      glTexCoord(0, 0); glVertex(-6, 0, -6);
+      glTexCoord(3, 0); glVertex(-6, 0,  6);
+      glTexCoord(3, 1); glVertex(-6, 6,  6);
+      glTexCoord(0, 1); glVertex(-6, 6, -6);
+    glEnd();
+}
+
+drawWallCircles()
+{
+    glNormal(0, 0, 1);
+    glBegin(GL_QUADS);
+      glTexCoord(0, 0); glVertex(-6, 0, -6);
+      glTexCoord(3, 0); glVertex( 6, 0, -6);
+      glTexCoord(3, 1); glVertex( 6, 6, -6);
+      glTexCoord(0, 1); glVertex(-6, 6, -6);
+    glEnd();
+}
+
+static double PI = 3.14159265358979;
+
+// A big enclosing cube with no normals or texture coordinates - the sky
+// shaders below derive their sample direction purely from world position
+// (normalize(vWorldPos - eyePos)), so all this needs to provide is the
+// geometry. Used both as the directly-visible background (main pass) and
+// as the backdrop drawn into ENV_TEX's captures (buildEnvCubemap), so the
+// chrome logo reflects the same sky the camera sees.
+drawSkyBox(size)
+{
+    glBegin(GL_QUADS);
+      glVertex( size, -size, -size); glVertex( size,  size, -size); glVertex( size,  size,  size); glVertex( size, -size,  size);
+      glVertex(-size, -size, -size); glVertex(-size, -size,  size); glVertex(-size,  size,  size); glVertex(-size,  size, -size);
+      glVertex(-size,  size, -size); glVertex(-size,  size,  size); glVertex( size,  size,  size); glVertex( size,  size, -size);
+      glVertex(-size, -size, -size); glVertex( size, -size, -size); glVertex( size, -size,  size); glVertex(-size, -size,  size);
+      glVertex(-size, -size,  size); glVertex( size, -size,  size); glVertex( size,  size,  size); glVertex(-size,  size,  size);
+      glVertex(-size, -size, -size); glVertex(-size,  size, -size); glVertex( size,  size, -size); glVertex( size, -size, -size);
+    glEnd();
+}
+
+// Bakes a procedural cloud sky into SKY_TEX, re-baked every
+// SKY_REBAKE_INTERVAL frames (see enum above) rather than only once, so
+// the sun glow (shader 5) tracks the orbiting light - sunDir is that
+// light's current direction, passed straight through as a uniform. Each
+// of the cubemap's 6 faces is filled by a single quad sized to exactly
+// span that face's 90-degree view frustum - the same "look in 6
+// directions" setup as buildEnvCubemap - so the fragment shader just has
+// to shade whatever direction each pixel of that quad corresponds to.
+buildSkyCubemap(vec3 sunDir)
+{
+    for (f = 0; f < 6; f++)
+    {
+        dx = 0; dy = 0; dz = 0; ux = 0; uy = 0; uz = 0;
+        if (f == 0)      { dx =  1;               ux = 0; uy = -1; uz =  0; } // +X
+        else if (f == 1) { dx = -1;               ux = 0; uy = -1; uz =  0; } // -X
+        else if (f == 2) {           dy =  1;     ux = 0; uy =  0; uz =  1; } // +Y
+        else if (f == 3) {           dy = -1;     ux = 0; uy =  0; uz = -1; } // -Y
+        else if (f == 4) {                 dz = 1; ux = 0; uy = -1; uz =  0; } // +Z
+        else             {                 dz = -1; ux = 0; uy = -1; uz =  0; } // -Z
+
+        glCaptureBegin(SKY_TEX, f);
+        gluPerspective(90, 1, 0.05, 50);
+        gluLookAt(0, 0, 0, dx, dy, dz, ux, uy, uz);
+        glSetShader(5, 5);
+        int locSunDir = glGetUniformLoc("sunDir");
+        glUniform3f(locSunDir, sunDir.x, sunDir.y, sunDir.z);
+
+        vec3 fwd = vec3(dx, dy, dz);
+        vec3 up = vec3(ux, uy, uz);
+        vec3 rightV = cross(fwd, up);
+
+        dist = 10.0;
+        vec3 center = fwd * dist;
+        vec3 c1 = center - rightV * dist - up * dist;
+        vec3 c2 = center + rightV * dist - up * dist;
+        vec3 c3 = center + rightV * dist + up * dist;
+        vec3 c4 = center - rightV * dist + up * dist;
+
+        glBegin(GL_QUADS);
+          glVertex(c1.x, c1.y, c1.z);
+          glVertex(c2.x, c2.y, c2.z);
+          glVertex(c3.x, c3.y, c3.z);
+          glVertex(c4.x, c4.y, c4.z);
+        glEnd();
+
+        glCaptureEnd();
+    }
+}
+
+// Procedurally renders a WALL_TEX_SIZE^2 checkerboard ("squares") pattern
+// into WALL_TEX_SQUARES using the SAME capture pipeline as SHADOW_TEX/
+// ENV_TEX above (glCaptureTex + ordinary draw calls with the flat-color
+// shader further down), rather than uploading a CPU-built pixel array via
+// glSetTex().
+//
+// CONFIRMED ENGINE BUG (evalpack.js, glSetTex3D's GL_UNSIGNED_BYTE upload
+// path, ~4050-4059): for every pixel format - not just the legacy
+// KGL_BGRA32/"O" packed format - the UNSIGNED_BYTE branch consumes only
+// ONE array element per PIXEL and bit-decomposes it into the N output
+// channels (pixel&255, pixel>>8&255, pixel>>16&255, pixel>>24&255), i.e.
+// it expects one pre-packed `r + g*256 + b*65536 + a*16777216` int per
+// pixel, not one array slot per channel. The FLOAT/HALF_FLOAT branches
+// two lines below it (~4060-4063) do the opposite: they advance srcOfs
+// once per CHANNEL, reading `bytesPerElem` separate values per pixel, as
+// the "double array[]" signature and every other example in this file
+// would lead you to expect. That asymmetry between the byte path and the
+// float paths is the bug - confirmed by writing an R/G/B/A four-elements-
+// per-pixel buffer (matching the documented signature) and observing
+// every pixel come out red-tinted with the wrong alpha, then confirming
+// a single packed-int-per-pixel buffer of the SAME data renders exactly
+// right. Filed as a bug rather than worked around here because the
+// packed convention is undocumented and inconsistent with the rest of
+// this API; this function instead builds the pattern once with ordinary
+// draw calls into a captured texture, using only already-verified
+// machinery. Built once at startup, like the mesh/env cubemap.
+buildSquaresTexture()
+{
+    glCaptureTex(WALL_TEX_SQUARES, WALL_TEX_SIZE, WALL_TEX_SIZE, GL_RGBA + GL_REPEAT);
+    glCaptureBegin(WALL_TEX_SQUARES);
+    glOrtho(0, 1, 0, 1, -1, 1);
+    glLoadIdentity();
+    glSetShader(3, 3);
+    int locColor = glGetUniformLoc("flatColor");
+
+    tiles = 8;
+    cell = 1.0 / tiles;
+    for (ty = 0; ty < tiles; ty++)
+    {
+        for (tx = 0; tx < tiles; tx++)
+        {
+            parity = (tx + ty) % 2;
+            if (parity == 0) glUniform3f(locColor, 0.92, 0.92, 0.94);
+            else glUniform3f(locColor, 0.16, 0.22, 0.35);
+
+            x0 = tx * cell; x1 = x0 + cell;
+            y0 = ty * cell; y1 = y0 + cell;
+            glBegin(GL_QUADS);
+              glVertex(x0, y0, 0);
+              glVertex(x1, y0, 0);
+              glVertex(x1, y1, 0);
+              glVertex(x0, y1, 0);
+            glEnd();
+        }
+    }
+    glCaptureEnd();
+}
+
+// Same approach as buildSquaresTexture() above, but a polka-dot
+// ("circles") pattern into WALL_TEX_CIRCLES: one background quad plus a
+// grid of filled-circle triangle fans.
+buildCirclesTexture()
+{
+    glCaptureTex(WALL_TEX_CIRCLES, WALL_TEX_SIZE, WALL_TEX_SIZE, GL_RGBA + GL_REPEAT );
+    glCaptureBegin(WALL_TEX_CIRCLES);
+    glOrtho(0, 1, 0, 1, -1, 1);
+    glLoadIdentity();
+    glSetShader(3, 3);
+    int locColor = glGetUniformLoc("flatColor");
+
+    glUniform3f(locColor, 0.96, 0.96, 0.92);
+    glBegin(GL_QUADS);
+      glVertex(0, 0, 0);
+      glVertex(1, 0, 0);
+      glVertex(1, 1, 0);
+      glVertex(0, 1, 0);
+    glEnd();
+
+    cells = 8;
+    cell = 1.0 / cells;
+    dotRadius = cell * 0.35;
+    dotSegs = 20;
+    glUniform3f(locColor, 0.92, 0.35, 0.24);
+
+    for (cy = 0; cy < cells; cy++)
+    {
+        for (cx = 0; cx < cells; cx++)
+        {
+            centerX = (cx + 0.5) * cell;
+            centerY = (cy + 0.5) * cell;
+
+            glBegin(GL_TRIANGLE_FAN);
+              glVertex(centerX, centerY, 0);
+              for (i = 0; i <= dotSegs; i++)
+              {
+                  a = 2.0 * PI * (i / dotSegs);
+                  glVertex(centerX + cos(a) * dotRadius, centerY + sin(a) * dotRadius, 0);
+              }
+            glEnd();
+        }
+    }
+    glCaptureEnd();
+}
+
+// Emits a smooth tube (an open cylinder, no end caps) running from p0 to
+// p1 with the given radius, as a ring of `segs` quads around the
+// circumference. The end caps are left to whatever sphere joint gets
+// drawn at each endpoint by drawSphereAt() below.
+drawTube(vec3 p0, vec3 p1, radius, segs)
+{
+    vec3 axis = p1 - p0;
+    axisLen = sqrt(dot(axis, axis));
+    vec3 dir = axis * (1.0 / axisLen);
+
+    // Build an arbitrary basis (rightV, upV) perpendicular to dir.
+    vec3 up = vec3(0, 1, 0);
+    if (abs(dir.y) > 0.99) up = vec3(1, 0, 0);
+    vec3 rightV = cross(dir, up);
+    rightLen = sqrt(dot(rightV, rightV));
+    rightV = rightV * (1.0 / rightLen);
+    vec3 upV = cross(rightV, dir);
+
+    for (i = 0; i < segs; i++)
+    {
+        a0 = (i / segs) * 2.0 * PI;
+        a1 = ((i + 1) / segs) * 2.0 * PI;
+
+        vec3 n0 = rightV * cos(a0) + upV * sin(a0);
+        vec3 n1 = rightV * cos(a1) + upV * sin(a1);
+
+        vec3 v0a = p0 + n0 * radius;
+        vec3 v0b = p0 + n1 * radius;
+        vec3 v1a = p1 + n0 * radius;
+        vec3 v1b = p1 + n1 * radius;
+
+        glNormal(n0.x, n0.y, n0.z);
+        glVertex(v0a.x, v0a.y, v0a.z);
+        glNormal(n1.x, n1.y, n1.z);
+        glVertex(v0b.x, v0b.y, v0b.z);
+        glNormal(n1.x, n1.y, n1.z);
+        glVertex(v1b.x, v1b.y, v1b.z);
+        glNormal(n0.x, n0.y, n0.z);
+        glVertex(v1a.x, v1a.y, v1a.z);
+    }
+}
+
+// Emits a smooth UV sphere at `center`, used as a rounded joint cap at
+// each bend of the logo's tube loop so consecutive tube segments meet
+// without a visible seam (pole rows are degenerate quads - cheap and
+// fine at this polycount).
+drawSphereAt(vec3 center, radius, lonSegs, latSegs)
+{
+    for (j = 0; j < latSegs; j++)
+    {
+        theta0 = PI * (j / latSegs) - PI * 0.5;
+        theta1 = PI * ((j + 1) / latSegs) - PI * 0.5;
+
+        y0 = sin(theta0); ring0 = cos(theta0);
+        y1 = sin(theta1); ring1 = cos(theta1);
+
+        for (i = 0; i < lonSegs; i++)
+        {
+            phi0 = 2.0 * PI * (i / lonSegs);
+            phi1 = 2.0 * PI * ((i + 1) / lonSegs);
+
+            vec3 n00 = vec3(ring0 * cos(phi0), y0, ring0 * sin(phi0));
+            vec3 n01 = vec3(ring0 * cos(phi1), y0, ring0 * sin(phi1));
+            vec3 n10 = vec3(ring1 * cos(phi0), y1, ring1 * sin(phi0));
+            vec3 n11 = vec3(ring1 * cos(phi1), y1, ring1 * sin(phi1));
+
+            vec3 v00 = center + n00 * radius;
+            vec3 v01 = center + n01 * radius;
+            vec3 v10 = center + n10 * radius;
+            vec3 v11 = center + n11 * radius;
+
+            glNormal(n00.x, n00.y, n00.z);
+            glVertex(v00.x, v00.y, v00.z);
+            glNormal(n01.x, n01.y, n01.z);
+            glVertex(v01.x, v01.y, v01.z);
+            glNormal(n11.x, n11.y, n11.z);
+            glVertex(v11.x, v11.y, v11.z);
+            glNormal(n10.x, n10.y, n10.z);
+            glVertex(v10.x, v10.y, v10.z);
+        }
+    }
+}
+
+// Advances from `from` by `delta` (a direction vector already scaled to
+// the move's length), drawing the tube segment and dropping a sphere
+// joint at the new point, and returns that new point so calls can be
+// chained (p = logoStep(p, ...)).
+vec3 logoStep(vec3 from, vec3 delta, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs)
+{   
+    vec3 to = from + delta;
+    drawTube(from, to, tubeRadius, tubeSegs);
+    drawSphereAt(to, tubeRadius, jointLonSegs, jointLatSegs);
+    
+    return to;
+}
+
+// Builds the actual SGI cube logo: a single closed chrome tube following
+// the same 18-move axis-aligned path as BRL-CAD's SGI_Cube script
+// (brl-cad.github.io/docs/wiki/SGI_Cube.html) - forward/back step Z,
+// left/right step X, up/down step Y, alternating between two edge
+// lengths (their i=1000, j=800; radius=100). It's a single continuous
+// zigzag through true 3D space, not flat per-face rings - it's the fact
+// that it folds back through the same region from different directions
+// that makes it read as several overlapping rectangular loops when
+// rendered, the way the real logo does. The path is a closed loop: 18
+// moves return exactly to the start (verified by tracing it by hand).
+buildLogoMesh()
+{
+    edgeI = 2.0;
+    edgeJ = 1.6;
+    tubeRadius = 0.2;
+    tubeSegs = 12;
+    jointLonSegs = 10;
+    jointLatSegs = 6;
+
+    vec3 fwd   = vec3(0, 0, 1);
+    vec3 back  = vec3(0, 0, -1);
+    vec3 left  = vec3(-1, 0, 0);
+    vec3 right = vec3(1, 0, 0);
+    vec3 up    = vec3(0, 1, 0);
+    vec3 down  = vec3(0, -1, 0);
+
+    // The path's 18 moves trace a fixed shape whose bounding-box center
+    // sits at (-0.8,-1.2,0.8) relative to wherever it starts (verified by
+    // tracing all deltas by hand). Starting here instead puts that center
+    // exactly at local (0,0,0), so the caller's model matrix - which
+    // rotates first, then translates (see the () function below) - spins
+    // the logo in place around its own middle instead of gyrating around
+    // empty space. Positioning above the floor is the model matrix's job
+    // now (its translate(...) call), not this function's.
+    vec3 p = vec3(0.8, 1.2, -0.8);
+    drawSphereAt(p, tubeRadius, jointLonSegs, jointLatSegs);
+
+    p = logoStep(p, fwd   * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, left  * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, down  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, right * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, up    * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, back  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, down  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, fwd   * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, left  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, back  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, right * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, up    * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, left  * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, down  * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, fwd   * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, up    * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, back  * edgeJ, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    p = logoStep(p, right * edgeI, tubeRadius, tubeSegs, jointLonSegs, jointLatSegs);
+    // p is now back at start - the loop closes exactly.
+}
+
+// Bakes a small environment cubemap centered on the logo, once at
+// startup, so the chrome shader below can do real-time reflection
+// mapping (textureCube + reflect()) - the same technique SGI's own demo
+// used to reflect the room around their logo. The captured content (the
+// procedural sky + the flat-shaded floor + the two unlit textured walls)
+// never changes over time - only the light orbits, and the light isn't
+// part of the reflected environment - so one bake is enough, same
+// tradeoff as baking the mesh and the sky itself. Floor/walls are drawn
+// unlit (shaders 3/4) for the same reason: nothing in this capture
+// should depend on the light's current position. Far plane is 100 (not
+// buildSkyCubemap's own 50) so the size-40 skybox cube - whose corners
+// sit 40*sqrt(3)=~69 units out - doesn't get near-clipped.
+buildEnvCubemap(eyeY)
+{
+    for (f = 0; f < 6; f++)
+    {
+        dx = 0; dy = 0; dz = 0; ux = 0; uy = 0; uz = 0;
+        if (f == 0)      { dx =  1;               ux = 0; uy = -1; uz =  0; } // +X
+        else if (f == 1) { dx = -1;               ux = 0; uy = -1; uz =  0; } // -X
+        else if (f == 2) {           dy =  1;     ux = 0; uy =  0; uz =  1; } // +Y
+        else if (f == 3) {           dy = -1;     ux = 0; uy =  0; uz = -1; } // -Y
+        else if (f == 4) {                 dz = 1; ux = 0; uy = -1; uz =  0; } // +Z
+        else             {                 dz = -1; ux = 0; uy = -1; uz =  0; } // -Z
+
+        glCaptureBegin(ENV_TEX, f);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        gluPerspective(90, 1, 0.05, 100);
+        gluLookAt(0, eyeY, 0, dx, eyeY + dy, dz, ux, uy, uz);
+
+        glSetShader(6, 6);
+        glActiveTexture(4);
+        int locSkyTexEnv = glGetUniformLoc("skyTex");
+        glUniform1i(locSkyTexEnv, 4);
+        glBindTex(4, SKY_TEX);
+        int locEyePosSkyEnv = glGetUniformLoc("eyePos");
+        glUniform3f(locEyePosSkyEnv, 0, eyeY, 0);
+        drawSkyBox(60);
+
+        glSetShader(3, 3);
+        int locFlatColor = glGetUniformLoc("flatColor");
+        glUniform3f(locFlatColor, 0.5, 0.52, 0.55);
+        drawFloor();
+
+        glSetShader(4, 4);
+        glActiveTexture(3);
+        int locWallTex = glGetUniformLoc("wallTex");
+        glUniform1i(locWallTex, 3);
+        glBindTex(3, WALL_TEX_SQUARES);
+        drawWallSquares();
+        glBindTex(3, WALL_TEX_CIRCLES);
+        drawWallCircles();
+
+        glCaptureEnd();
+    }
+}
+
+static vec3 camPos;
+static camHorizAngle;
+static camVertiAngle;
+
+// playercontrols() drives camPos/camHorizAngle/camVertiAngle from
+// WASD + mouse-drag look; the main loop turns that into the actual GL
+// camera each frame via gluPerspective/gluLookAt.
+playercontrols()
+{
+   static oldMouseX;
+   static oldMouseY;
+
+   f = 0.1;
+   if (keystatus[0x2a]) f /= 4; // shift: slow
+   if (keystatus[0x36]) f *= 4; // ctrl: fast
+   vx = (keystatus[32] - keystatus[30]) * f; // D - A
+   vy = (keystatus[17] - keystatus[31]) * f; // W - S
+
+   // right/forward must match the gluLookAt forward vector in the main
+   // loop (see the coordinate-system note at the top of this file) or
+   // WASD would strafe/walk sideways relative to where the camera is
+   // actually looking.
+   rightX = cos(camHorizAngle);
+   rightZ = -sin(camHorizAngle);
+   forwardX = -cos(camVertiAngle) * sin(camHorizAngle);
+   forwardY = sin(camVertiAngle);
+   forwardZ = -cos(camVertiAngle) * cos(camHorizAngle);
+
+   camPos.x += rightX * vx + forwardX * vy;
+   camPos.y += forwardY * vy;
+   camPos.z += rightZ * vx + forwardZ * vy;
+
+   mouseSpeedX = (mousx - oldMouseX) * 0.01;
+   mouseSpeedY = (mousy - oldMouseY) * 0.01;
+   oldMouseX = mousx;
+   oldMouseY = mousy;
+   if (bstatus == 1)
+   {
+      camHorizAngle -= mouseSpeedX;
+      camVertiAngle -= mouseSpeedY;
+   }
+}
+
+()
+{
+if (numframes == 0)
+   {
+      camPos = vec3(0, 5, 12);
+      camHorizAngle = 0;// faces the sponge at the origin from here
+      camVertiAngle = 0;
+   }
+
+    if (numframes == 0)
+    {
+        glCaptureTex(SHADOW_TEX, SHADOW_SIZE, SHADOW_SIZE, GL_RGBA | GL_CLAMP_TO_EDGE | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glCullFace(GL_NONE);
+
+        // Wall textures must exist before buildEnvCubemap() below samples
+        // them into the reflection. Allocated once here; SKY_TEX and
+        // ENV_TEX are only ALLOCATED here too - they're actually filled
+        // by the periodic rebake below (which also runs on frame 0,
+        // since 0 % SKY_REBAKE_INTERVAL == 0), so the sun glow has a
+        // real light direction to bake in from the very first frame.
+        buildSquaresTexture();
+        buildCirclesTexture();
+        glCaptureTexCube(SKY_TEX, SKY_SIZE, SKY_SIZE, GL_RGBA | GL_CLAMP_TO_EDGE);
+        glCaptureTexCube(ENV_TEX, ENV_SIZE, ENV_SIZE, GL_RGBA | GL_CLAMP_TO_EDGE);
+
+        // Bake the logo once - it's static geometry.
+        glBeginMesh(LOGO_MESH);
+          glBegin(GL_QUADS);
+            buildLogoMesh();
+          glEnd();
+        glEndMesh();
+    }
+
+    double angle = klock() * 0.3;
+    s=0.5;
+    double lightX = s*6.0 * cos(angle);
+    double lightZ = s*6.0 * sin(angle);
+    double lightY = s*7.0 + 2.*cos(angle*2);
+    
+    double lightLen = sqrt(lightX*lightX + lightY*lightY + lightZ*lightZ);
+    double lightDirX = lightX / lightLen;
+    double lightDirY = lightY / lightLen;
+    double lightDirZ = lightZ / lightLen;
+
+    // Re-bake the sky (and the env cubemap, since it uses the sky as its
+    // backdrop) every SKY_REBAKE_INTERVAL frames so the sun glow tracks
+    // the orbiting light, rather than paying for both bakes every frame.
+    // This also covers frame 0 (0 % anything == 0), so no separate
+    // first-bake call is needed above.
+    if (numframes % SKY_REBAKE_INTERVAL == 0)
+    {
+        buildSkyCubemap(vec3(lightDirX, lightDirY, lightDirZ));
+        // 1.3 is the logo's own vertical center (the path spans roughly
+        // y=0.1..2.5 - see buildLogoMesh's starting point/offsets), so
+        // the baked reflection lines up with where the logo actually sits.
+        buildEnvCubemap(1.3);
+    }
+
+    // --- define SGI logo world transform
+    mat4 model_sgi = mat4(1.5);
+    // Perform model Translate Rotate Scale
+    RAD2DEG = 180. / pi;
+    deg_x=45 + RAD2DEG*angle*2;
+    deg_y=45 + RAD2DEG*angle*2;
+    deg_z=45 + RAD2DEG*angle*2;
+    translate(model_sgi, 0,2,0);
+    rotate(model_sgi, deg_z, 0,0,1);
+    rotate(model_sgi, deg_y, 0,1,0);
+    rotate(model_sgi, deg_x, 1,0,0);
+    
+
+    // ---- Pass 1: render depth from the light's point of view ----
+    glCaptureBegin(SHADOW_TEX);
+    glClearColor(1, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glOrtho(-9, 9, -9, 9, 1, 20);
+    gluLookAt(lightX, lightY, lightZ, 0, 0, 0, 0, 1, 0);
+    glGetProjectionMatrix(lightProjArr);
+    glGetMatrix(lightViewArr);
+    glSetShader(0, 0);
+    drawFloor();
+    glPushMatrix();
+    glMultMatrix(model_sgi);
+    glMesh(LOGO_MESH);
+    glPopMatrix();
+    glCaptureEnd();
+
+    // ---- Pass 2: render the scene from the camera ----
+    glClearColor(0.05, 0.07, 0.10, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    
+    //gluPerspective(50, double(xres) / double(yres), 0.1, 100);
+    //gluLookAt(8, 6, 10, 0, 1, 0, 0, 1, 0);
+    
+    playercontrols();
+
+    gluPerspective(60, double(xres) / double(yres), 0.1, 1000.0);
+    vec3 forward = vec3(-cos(camVertiAngle)*sin(camHorizAngle), sin(camVertiAngle), -cos(camVertiAngle)*cos(camHorizAngle));
+    vec3 target = camPos + forward;
+    gluLookAt(camPos.x, camPos.y, camPos.z, target.x, target.y, target.z, 0, 1, 0);
+    
+
+    // Skybox: the same procedural cloud cubemap reflected in the chrome
+    // logo (see buildSkyCubemap/shader 5). Drawn first, but ordinary
+    // depth testing still lets the floor/walls/logo below draw over it
+    // correctly regardless of order - the box is just far larger than
+    // the scene (and safely inside gluPerspective's far=100 above).
+    glSetShader(6, 6);
+    glActiveTexture(4);
+    int locSkyTexMain = glGetUniformLoc("skyTex");
+    glUniform1i(locSkyTexMain, 4);
+    glBindTex(4, SKY_TEX);
+    int locEyePosSkyMain = glGetUniformLoc("eyePos");
+    glUniform3f(locEyePosSkyMain, 8, 6, 10);
+    
+    glCullFace(GL_FRONT);
+    drawSkyBox(40);
+    glCullFace(GL_NONE);
+
+    // Optional light-position proxy: a small unlit sphere at the real,
+    // every-frame light position (not baked, so unlike the sky's glow it
+    // tracks exactly, with no stepping between rebakes) - lets you see
+    // what the sky glow/shadow/specular highlight are all following.
+    if (SHOW_LIGHT_PROXY)
+    {
+        glSetShader(3, 3);
+        int locLightProxyColor = glGetUniformLoc("flatColor");
+        glUniform3f(locLightProxyColor, 1.0, 0.95, 0.75);
+        drawSphereAt(vec3(lightX, lightY, lightZ), 0.3, 12, 8);
+    }
+
+    // Floor: ordinary shadow-lit diffuse material.
+    glSetShader(1, 1);
+
+    int locLightProj = glGetUniformLoc("lightProj");
+    int locLightView = glGetUniformLoc("lightView");
+    glUniformMatrix4fv(locLightProj, lightProjArr);
+    glUniformMatrix4fv(locLightView, lightViewArr);
+
+    int locLightDir = glGetUniformLoc("lightDir");
+    glUniform3f(locLightDir, lightDirX, lightDirY, lightDirZ);
+
+    glActiveTexture(1);
+    glBindTex(1, SHADOW_TEX);
+    int locShadowMap = glGetUniformLoc("shadowMap");
+    glUniform1i(locShadowMap, 1);
+
+    int locBaseColor = glGetUniformLoc("baseColor");
+    glUniform3f(locBaseColor, 0.55, 0.58, 0.62);
+    drawFloor();
+
+    // Walls: same textures as inside buildEnvCubemap, but here (shader 7)
+    // they also receive the shadow, same lightProj/lightView/shadowMap
+    // already computed above for the floor. buildEnvCubemap's own copy
+    // of the walls stays on the plain unlit shader 4, since that capture
+    // deliberately doesn't depend on the light's current position.
+    glSetShader(7, 7);
+
+    int locWallLightProj = glGetUniformLoc("lightProj");
+    int locWallLightView = glGetUniformLoc("lightView");
+    glUniformMatrix4fv(locWallLightProj, lightProjArr);
+    glUniformMatrix4fv(locWallLightView, lightViewArr);
+
+    glActiveTexture(1);
+    glBindTex(1, SHADOW_TEX);
+    int locWallShadowMap = glGetUniformLoc("shadowMap");
+    glUniform1i(locWallShadowMap, 1);
+
+    glActiveTexture(3);
+    int locWallTex = glGetUniformLoc("wallTex");
+    glUniform1i(locWallTex, 3);
+    glBindTex(3, WALL_TEX_SQUARES);
+    drawWallSquares();
+    glBindTex(3, WALL_TEX_CIRCLES);
+    drawWallCircles();
+
+    // Logo: chrome, environment-mapped material.
+    glSetShader(2, 2);
+
+    int locEyePos = glGetUniformLoc("eyePos");
+    glUniform3f(locEyePos, 8, 6, 10);
+
+    int locLightDir2 = glGetUniformLoc("lightDir");
+    glUniform3f(locLightDir2, lightDirX, lightDirY, lightDirZ);
+
+    glActiveTexture(2);
+    glBindTex(2, ENV_TEX);
+    int locEnvMap = glGetUniformLoc("envMap");
+    glUniform1i(locEnvMap, 2);
+
+    // The chrome shader needs the true world-space position/normal (see
+    // its comment above), which its own uModelView-derived built-ins
+    // can't give it, so hand it the model matrix directly.
+    int locModel = glGetUniformLoc("model");
+    glUniformMatrix4fv(locModel, model_sgi);
+
+    glPushMatrix();
+    glMultMatrix(model_sgi);
+    glMesh(LOGO_MESH);
+    glPopMatrix();
+
+    setcol(255, 255, 255);
+    moveto(10, yres - 20);
+    printf("SGI-Style Chrome Logo Demo");
+}
+
+@v
+// Shadow pass: only depth matters, written by the fragment shader from
+// gl_FragCoord.z (already the standard post-viewport [0,1] depth value,
+// correct regardless of ortho/perspective).
+void main()
+{
+    gl_Position = ftransform();
+}
+
+@f
+vec4 packDepth(float depth)
+{
+    vec4 bitShift = vec4(256.0*256.0*256.0, 256.0*256.0, 256.0, 1.0);
+    vec4 bitMask = vec4(0.0, 1.0/256.0, 1.0/256.0, 1.0/256.0);
+    vec4 res = fract(depth * bitShift);
+    res -= res.xxyz * bitMask;
+    return res;
+}
+void main()
+{
+    gl_FragColor = packDepth(gl_FragCoord.z);
+}
+
+@v
+// Main pass: forwards world-space position/normal (gl_Vertex/gl_Normal
+// are already world-space here, since scene objects are never rotated
+// or scaled - only the camera's gluLookAt touches the modelview matrix)
+// plus the light-space position used for the shadow-map lookup.
+uniform mat4 lightProj;
+uniform mat4 lightView;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec4 vLightSpacePos;
+void main()
+{
+    vWorldPos = gl_Vertex.xyz;
+    vNormal = gl_Normal;
+    vLightSpacePos = lightProj * lightView * vec4(vWorldPos, 1.0);
+    gl_Position = ftransform();
+}
+
+@f
+uniform sampler2D shadowMap;
+uniform vec3 lightDir;
+uniform vec3 baseColor;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec4 vLightSpacePos;
+
+float unpackDepth(vec4 rgba)
+{
+    vec4 bitShift = vec4(1.0/(256.0*256.0*256.0), 1.0/(256.0*256.0), 1.0/256.0, 1.0);
+    return dot(rgba, bitShift);
+}
+
+void main()
+{
+    vec3 n = normalize(vNormal);
+    vec3 l = normalize(lightDir);
+    float ndotl = max(dot(n, l), 0.0);
+
+    vec3 shadowCoord = vLightSpacePos.xyz / vLightSpacePos.w;
+    shadowCoord = shadowCoord * 0.5 + 0.5;
+
+    float shadow = 1.0;
+    if (shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 &&
+        shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0 &&
+        shadowCoord.z >= 0.0 && shadowCoord.z <= 1.0)
+    {
+        float storedDepth = unpackDepth(texture2D(shadowMap, shadowCoord.xy));
+        float bias = 0.0025;
+        if (shadowCoord.z - bias > storedDepth) shadow = 0.35;
+    }
+
+    vec3 color = baseColor * (0.25 + 0.75 * ndotl * shadow);
+    gl_FragColor = vec4(color, 1.0);
+}
+
+@v
+// Chrome pass: forwards world-space position/normal for the logo. Unlike
+// the floor/shadow pass above, the logo now goes through its own model
+// matrix (translate+rotate in the () function below), so gl_Vertex/
+// gl_Normal are OBJECT space, not world space - gl_ModelViewMatrix won't
+// help here since it's object-to-CAMERA (this engine's modelview stack
+// bakes the gluLookAt camera and the model's glMultMatrix together, with
+// no separate object-to-world stage exposed to shaders), and eyePos/
+// lightDir/the shadow map below are all expressed in true world space.
+// So `model` is passed in explicitly and applied by hand. mat3(model) is
+// exact for the normal (no inverse-transpose needed) because model is a
+// similarity transform - uniform scale + rotation + translation only,
+// no shear or non-uniform scale.
+uniform mat4 model;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+void main()
+{
+    vWorldPos = (model * gl_Vertex).xyz;
+    vNormal = normalize(mat3(model) * gl_Normal);
+    gl_Position = ftransform();
+}
+
+@f
+// Chrome material: samples the baked environment cubemap along the
+// mirror-reflection direction (the classic env-mapping trick), tinted
+// slightly cool/metallic, plus a sharp specular highlight and a fresnel
+// rim so it still reads as "shiny metal" rather than a flat mirror.
+uniform samplerCube envMap;
+uniform vec3 eyePos;
+uniform vec3 lightDir;
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+
+void main()
+{
+    vec3 n = normalize(vNormal);
+    vec3 viewDir = normalize(vWorldPos - eyePos);
+    vec3 r = reflect(viewDir, n);
+    vec3 envColor = textureCube(envMap, r).rgb;
+
+    vec3 l = normalize(lightDir);
+    vec3 h = normalize(l - viewDir);
+    float spec = pow(max(dot(n, h), 0.0), 64.0);
+
+    float fresnel = pow(1.0 - max(dot(n, -viewDir), 0.0), 3.0);
+    vec3 chromeTint = vec3(0.85, 0.87, 0.90);
+
+    vec3 color = envColor * chromeTint * (0.7 + 0.3 * fresnel) + vec3(1.0, 0.98, 0.95) * spec;
+    gl_FragColor = vec4(color, 1.0);
+}
+
+@v
+// Flat pass: used only while baking the environment cubemap, to give the
+// floor a plain unlit color (nothing else is drawn into that cubemap).
+void main()
+{
+    gl_Position = ftransform();
+}
+
+@f
+uniform vec3 flatColor;
+void main()
+{
+    gl_FragColor = vec4(flatColor, 1.0);
+}
+
+@v
+// Wall pass: unlit textured planes (used for both walls, in both the
+// main scene and the env-cubemap bake - see drawWallSquares/Circles and
+// buildEnvCubemap above). Unlit for the same reason the flat floor
+// material is unlit inside the cubemap bake; kept unlit in the main pass
+// too so the walls look identical there and in the reflection.
+varying vec2 vTexCoord;
+void main()
+{
+    vTexCoord = gl_MultiTexCoord0.xy;
+    gl_Position = ftransform();
+}
+
+@f
+uniform sampler2D wallTex;
+varying vec2 vTexCoord;
+void main()
+{
+    gl_FragColor = texture2D(wallTex, vTexCoord);
+}
+
+@v
+// Sky-generator pass: used only while baking SKY_TEX (buildSkyCubemap).
+varying vec3 vWorldPos;
+void main()
+{
+    vWorldPos = gl_Vertex.xyz;
+    gl_Position = ftransform();
+}
+
+@f
+#use noise
+// Cloud generator, in the spirit of Hugo Elias's "Cloud Cover" article
+// (freespace.virgin.net/hugo.elias/models/m_clouds.htm): four octaves of
+// noise summed with halving amplitude and doubling frequency - his
+// CloudMap = Map1 + Map2/2 + Map3/4 + Map4/8, done here as one
+// continuous fBm using this build's real gradient-noise noise(vec3)
+// (#use glsl_math) rather than resampling four fixed-size LUTs - then
+// passed through his CloudExpCurve (same formula, same variable names)
+// to carve clear sky out of what would otherwise be uniform haze
+// everywhere, and finally blended between a blue-sky gradient and white
+// cloud. Evaluated directly over the cubemap direction (not per-face UV)
+// so there are no seams at the cube's edges. cloudCover/cloudSharpness
+// below are the knobs to retune the look (cloudCover higher = less
+// cloud; cloudSharpness closer to 1.0 = softer/fuzzier clouds, per the
+// original article).
+//
+// Also ported the article's "Glow from the Sun" section: a two-term
+// exponential falloff around sunDir (a tight core plus a broad soft
+// halo, standing in for his separately-rendered Glow map) added to the
+// sky color, and - per his observation #2 ("the clouds near the sun are
+// glowing much brighter than clouds far from the sun") - mixed into the
+// cloud color too so clouds near the sun pick up a warm tint. sunDir is
+// the real orbiting light's direction, uploaded fresh by buildSkyCubemap
+// every SKY_REBAKE_INTERVAL frames, so the glow visibly sweeps around
+// the sky over time. Not ported: his separate LensFlare map and
+// HazeExpCurve distance haze - both are screen-space/camera-relative
+// effects in the original, which doesn't fit a world-direction cubemap
+// baked independently of any particular camera.
+varying vec3 vWorldPos;
+uniform vec3 sunDir;
+
+float fbm(vec3 p)
+{
+    float sum = 0.0;
+    float amp = 1.0;
+    for (int i = 0; i < 4; i++)
+    {
+        sum += noise(p) * amp;
+        p *= 2.0;
+        amp *= 0.5;
+    }
+    return sum;
+}
+
+void main()
+{
+    vec3 dir = normalize(vWorldPos);
+    vec3 sun = normalize(sunDir);
+
+    float cloudCover = 0.055;
+    float cloudSharpness = 0.55;
+
+    float raw = fbm(dir * 3.0) * 0.5 + 0.5;
+    float c = max(raw - cloudCover, 0.0);
+    float cloudDensity = 1.0 - pow(cloudSharpness, c);
+
+    float horizon = pow(clamp(1.0 - abs(dir.y), 0.0, 1.0), 1.5);
+    vec3 skyZenith = vec3(0.25, 0.45, 0.85);
+    vec3 skyHorizon = vec3(0.75, 0.82, 0.90);
+    vec3 skyColor = mix(skyZenith, skyHorizon, horizon);
+
+    float sunAmount = max(dot(dir, sun), 0.0);
+    float glow = pow(sunAmount, 400.0) * 4.0 + pow(sunAmount, 8.0) * 0.6;
+    vec3 glowColor = vec3(1.0, 0.85, 0.55);
+    skyColor += glowColor * glow;
+
+    vec3 cloudColor = mix(vec3(1.0, 1.0, 1.0), glowColor, clamp(pow(sunAmount, 4.0) * 1.5, 0.0, 1.0));
+    vec3 color = mix(skyColor, cloudColor, clamp(cloudDensity, 0.0, 1.0));
+
+    gl_FragColor = vec4(color, 1.0);
+}
+
+@v
+// Skybox-display pass: used both for the directly-visible background
+// (main pass) and as the backdrop drawn into ENV_TEX's per-face captures
+// (buildEnvCubemap), so the chrome logo reflects the same sky the camera
+// sees.
+varying vec3 vWorldPos;
+void main()
+{
+    vWorldPos = gl_Vertex.xyz;
+    gl_Position = ftransform();
+}
+
+@f
+uniform samplerCube skyTex;
+uniform vec3 eyePos;
+varying vec3 vWorldPos;
+void main()
+{
+    vec3 dir = normalize(vWorldPos - eyePos);
+    gl_FragColor = textureCube(skyTex, dir);
+}
+
+@v
+// Wall + shadow pass: same texture sampling as the plain wall pass
+// (shader 4) above, but also makes the walls a shadow RECEIVER - same
+// vLightSpacePos-via-lightProj/lightView trick as the floor's own
+// shadow-lit pass (shader 1). Used only for the walls in the main scene
+// (see the () function below); buildEnvCubemap keeps using the plain
+// unlit shader 4 for its own copy of the walls, since that capture is
+// deliberately independent of the light's current position (see its
+// comment) - shadow casters and receivers aren't a fixed pairing tracked
+// by the engine, they're just "whatever you draw in the depth pass" and
+// "whatever you draw with a shader that samples it", chosen per draw
+// call, which is why the exact same geometry can use two different
+// shaders in two different passes like this.
+uniform mat4 lightProj;
+uniform mat4 lightView;
+varying vec2 vTexCoord;
+varying vec4 vLightSpacePos;
+void main()
+{
+    vTexCoord = gl_MultiTexCoord0.xy;
+    vLightSpacePos = lightProj * lightView * vec4(gl_Vertex.xyz, 1.0);
+    gl_Position = ftransform();
+}
+
+@f
+uniform sampler2D wallTex;
+uniform sampler2D shadowMap;
+varying vec2 vTexCoord;
+varying vec4 vLightSpacePos;
+
+float unpackDepthWall(vec4 rgba)
+{
+    vec4 bitShift = vec4(1.0/(256.0*256.0*256.0), 1.0/(256.0*256.0), 1.0/256.0, 1.0);
+    return dot(rgba, bitShift);
+}
+
+void main()
+{
+    vec3 shadowCoord = vLightSpacePos.xyz / vLightSpacePos.w;
+    shadowCoord = shadowCoord * 0.5 + 0.5;
+
+    float shadow = 1.0;
+    if (shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 &&
+        shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0 &&
+        shadowCoord.z >= 0.0 && shadowCoord.z <= 1.0)
+    {
+        float storedDepth = unpackDepthWall(texture2D(shadowMap, shadowCoord.xy));
+        float bias = 0.0025;
+        if (shadowCoord.z - bias > storedDepth) shadow = 0.35;
+    }
+
+    vec4 texColor = texture2D(wallTex, vTexCoord);
+    gl_FragColor = vec4(texColor.rgb * shadow, texColor.a);
+}
+

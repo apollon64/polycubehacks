@@ -1,0 +1,276 @@
+// frustumCulling.rice -- ported from frustumCulling.kc
+// (github.com/torbjoern/evaldraw-scripts, culling/frustumCulling.kc).
+//
+// A grid of points is tested against a second, independently-aimed
+// camera's view frustum (WASD-ish input mapping below); points inside
+// draw as a red 3D marker, points outside as a plain white dot. The
+// frustum's wireframe and near/far corners are drawn too, plus a line
+// showing that camera's look direction. Everything renders through the
+// ONE real rendering camera -- an external, semi-fixed observer set via
+// setcam() -- so the whole scene can be watched from outside.
+//
+// Differences from the .kc source, driven by what RICE actually has:
+// - GL_POINTS doesn't exist in this build (confirmed in
+//   rice_language_features.txt: only TRIANGLES/TRIANGLE_FAN/
+//   TRIANGLE_STRIP/QUADS/POLYGON are real primitives here), so the
+//   original's `glbegin(GL_POINTS); ... glVertex(...); glEnd();` point
+//   cloud doesn't port directly. It turns out not to matter: this whole
+//   scene only ever needed libdraw's 3D-projected moveto/lineto/setpix
+//   (all of which DO respond to setcam(), unlike raw GL geometry -- see
+//   menger_sponge.rice's header for why that distinction matters), so
+//   the point cloud is drawn with setpix() instead, no GL layer or
+//   shader needed anywhere in this file.
+// - drawsph() only has a 2D 3-arg (x,y,r) form in this build (checked
+//   evalpack.js's dispatch table: "drawSph(fff)" is the only entry) --
+//   the original's 3D 4-arg drawsph(x,y,z,r) call for marking in-frustum
+//   points doesn't exist. draw_marker() below (a small 3-axis jack drawn
+//   with 3D moveto/lineto) substitutes, so in-frustum points still stand
+//   out from the plain setpix() dots.
+// - #use glsl_math's vec3 replaces the source's own hand-rolled vec3
+//   struct plus its vecdot/vecCross helpers: dot()/cross()/length() are
+//   builtins usable in plain compiled code, so those helpers just aren't
+//   needed. normalize() still needs a hand-written (byref) version,
+//   since GLSL's normalize() is shader-only in RICE.
+// - Struct-by-reference needs an explicit `&` on the parameter (see
+//   menger_sponge.rice's header) -- used below only for normalize(),
+//   the one function here that actually mutates a vector it was handed.
+//   Nothing else needs it: planeFrom3Points()/setCamDef() write into the
+//   file's own static globals (planes[]/cam/campos/the frustum corner
+//   vars) directly, the same way the original does.
+// - The source mixes casing for several identifiers -- the struct is
+//   declared `vec3` but used as `Vec3` everywhere, `campos` is declared
+//   with a lowercase p but read back as `camPos` inside pointInFrustum(),
+//   and `degToRad` is defined but referenced as `degtorad` inside
+//   pointInFrustum() too. Old KC apparently resolved identifiers case-
+//   insensitively; RICE's own identifiers are ordinary compiled names,
+//   so all of the above are normalized to one consistent spelling here.
+
+#use glsl_math
+
+struct { vec3 normal; vec3 point; double d; } plane_t;
+struct { vec3 xaxis; vec3 yaxis; vec3 zaxis; } camera_t;
+
+static camera_t cam;
+static plane_t planes[6];
+enum { NEARP, FARP, TOP, BOTTOM, LEFTP, RIGHTP }
+
+// 4 near + 4 far frustum corners, filled in by setCamDef().
+static vec3 ntl, ntr, nbl, nbr;
+static vec3 ftl, ftr, fbl, fbr;
+
+static degToRad = pi/180;
+static nearD, farD;
+static vec3 campos;
+static fov = 0;
+
+()
+{
+   cls(0); clz(1e32);
+   d = 4 + 4*(-1 + 2*mousy/yres);
+   setcam(0, -d, -d, 0, 45*degToRad); // fixed external observer
+   
+
+   if (numframes == 0)
+   {
+      campos = vec3(0, 0, 0);
+   }
+
+   dx = (keystatus[203] - keystatus[205]) * 0.05; // right/left arrow
+   campos.y += (keystatus[2] - keystatus[3]) * 0.05; // '1'/'2'
+   dz = (keystatus[200] - keystatus[208]) * 0.05; // up/down arrow
+
+   hang = mousx/xres * 2*pi;
+
+   campos.x += cos(hang) * dz;
+   campos.z += sin(hang) * dz;
+
+   campos.x += cos(hang + pi/2) * dx;
+   campos.z += sin(hang + pi/2) * dx;
+
+   vec3 look_dir = vec3(cos(hang), 0, sin(hang));
+   look_dir = normalize(look_dir);
+
+   vec3 up_dir = vec3(0, 1, 0);
+   vec3 look_pos = vec3(campos.x + look_dir.x, campos.y - look_dir.y, campos.z + look_dir.z);
+
+   setCamDef(campos, look_pos, up_dir);
+
+   draw_frustum();
+
+   moveto(campos.x, campos.y, campos.z);
+   lineto(look_pos.x, look_pos.y, look_pos.z);
+
+   draw_scene();
+}
+
+draw_scene()
+{
+   num = 8;
+   radius = 2;
+   pts_active = 0;
+   max_pts = 0;
+
+   for (i = 0; i < num; i++)
+   for (j = 0; j < num; j++)
+   for (k = 0; k < num; k++)
+   {
+      vec3 pt = vec3(-radius + i/num*2*radius, -radius + j/num*2*radius, -radius + k/num*2*radius);
+
+      if (pointInFrustum(pt))
+      {
+         pts_active++;
+         setcol(255, 0, 0);
+         draw_marker(pt, .15);
+      }
+      else
+      {
+         setcol(255, 255, 255);
+         setpix(pt.x, pt.y, pt.z);
+      }
+
+      max_pts++;
+   }
+
+   setcol(255, 255, 255);
+   moveto(0, 0);
+   printf("%g of %g points active", pts_active, max_pts);
+}
+
+// drawsph() has no 3D form here (see header) -- a small 3-axis jack
+// stands in for it, marking in-frustum points.
+draw_marker(vec3 p, si)
+{
+   moveto(p.x-si, p.y, p.z); lineto(p.x+si, p.y, p.z);
+   moveto(p.x, p.y-si, p.z); lineto(p.x, p.y+si, p.z);
+   moveto(p.x, p.y, p.z-si); lineto(p.x, p.y, p.z+si);
+}
+
+// Axis-aligned frustum test in camera space: the technique this file's
+// header link (lighthouse3d) calls the "vectors" method.
+pointInFrustum(vec3 p)
+{
+   vec3 v = p - campos;
+
+   vec3 xaxis = cam.xaxis;
+   vec3 yaxis = cam.yaxis;
+   vec3 neg_zaxis = cam.zaxis * -1;
+
+   fov = 25*degToRad;
+   tang = tan(fov);
+   ratio = 1;
+
+   // Z (depth)
+   pcz = dot(v, neg_zaxis);
+   if (pcz > farD || pcz < nearD) return 0;
+
+   // Y
+   pcy = dot(v, yaxis);
+   aux = pcz * tang;
+   if (pcy > aux || pcy < -aux) return 0;
+
+   // X
+   pcx = dot(v, xaxis);
+   aux = pcz * tang * ratio;
+   if (pcx > aux || pcx < -aux) return 0;
+
+   return 1;
+}
+
+// The classic 6-plane frustum test (same header link's "planes" method).
+// setCamDef() always computes planes[] via planeFrom3Points(), but
+// draw_scene() exercises pointInFrustum() above instead -- this stays
+// available but uncalled, exactly like the original source.
+testFrustumSphere(vec3 p, ballRadi)
+{
+   for (l = 0; l < 6; l++)
+   {
+      dpr = dot(planes[l].normal, p);
+      dist = planes[l].d + dpr;
+      if (dist < -ballRadi) return 0;
+   }
+   return 1;
+}
+
+setCamDef(vec3 p, vec3 l, vec3 u)
+{
+   fov = 25*degToRad;
+   nearD = 1;
+   farD = 8;
+
+   ratio = 1;
+   nearH = 2*tan(fov*.5)*nearD;
+   nearW = nearH*ratio;
+
+   farH = 2*tan(fov*.5)*farD;
+   farW = farH*ratio;
+
+   // Z axis points from target back to the eye (opposite the look
+   // direction); X/Y complete a right-handed basis from that and "up".
+   cam.zaxis = p - l;
+   normalize(cam.zaxis);
+
+   cam.xaxis = cross(u, cam.zaxis);
+   normalize(cam.xaxis);
+
+   cam.yaxis = cross(cam.zaxis, cam.xaxis);
+
+   vec3 X = cam.xaxis;
+   vec3 Y = cam.yaxis;
+   vec3 Z = cam.zaxis;
+
+   vec3 nc = p - Z*nearD;
+   vec3 fc = p - Z*farD;
+
+   ntl = nc + Y*nearH - X*nearW;
+   ntr = nc + Y*nearH + X*nearW;
+   nbl = nc - Y*nearH - X*nearW;
+   nbr = nc - Y*nearH + X*nearW;
+
+   ftl = fc + Y*farH - X*farW;
+   ftr = fc + Y*farH + X*farW;
+   fbl = fc - Y*farH - X*farW;
+   fbr = fc - Y*farH + X*farW;
+
+   // set3Points-equivalent below assumes counter-clockwise winding.
+   planeFrom3Points(NEARP, ntl, ntr, nbr);
+   planeFrom3Points(FARP, ftr, ftl, fbl);
+   planeFrom3Points(TOP, ntr, ntl, ftl);
+   planeFrom3Points(BOTTOM, nbl, nbr, fbr);
+   planeFrom3Points(LEFTP, ntl, nbl, fbl);
+   planeFrom3Points(RIGHTP, nbr, ntr, fbr);
+}
+
+planeFrom3Points(planeIdx, vec3 v1, vec3 v2, vec3 v3)
+{
+   vec3 aux1 = v1 - v2;
+   vec3 aux2 = v3 - v2;
+
+   vec3 normal = cross(aux2, aux1);
+   normalize(normal);
+
+   dpr = dot(normal, v2);
+
+   planes[planeIdx].normal = normal;
+   planes[planeIdx].point = v2;
+   planes[planeIdx].d = -dpr;
+}
+
+draw_frustum()
+{
+   moveto(ntl.x, ntl.y, ntl.z);
+   lineto(ntr.x, ntr.y, ntr.z);
+   lineto(nbr.x, nbr.y, nbr.z);
+   lineto(nbl.x, nbl.y, nbl.z);
+   lineto(ntl.x, ntl.y, ntl.z);
+
+   moveto(ftl.x, ftl.y, ftl.z);
+   lineto(ftr.x, ftr.y, ftr.z);
+   lineto(fbr.x, fbr.y, fbr.z);
+   lineto(fbl.x, fbl.y, fbl.z);
+   lineto(ftl.x, ftl.y, ftl.z);
+
+   moveto(ntl.x, ntl.y, ntl.z); lineto(ftl.x, ftl.y, ftl.z);
+   moveto(ntr.x, ntr.y, ntr.z); lineto(ftr.x, ftr.y, ftr.z);
+   moveto(nbl.x, nbl.y, nbl.z); lineto(fbl.x, fbl.y, fbl.z);
+   moveto(nbr.x, nbr.y, nbr.z); lineto(fbr.x, fbr.y, fbr.z);
+}

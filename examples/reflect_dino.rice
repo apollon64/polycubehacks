@@ -1,48 +1,11 @@
 // Port of Mark Kilgard's reflectdino.c (1994/1997, the classic GLUT
 // "Leapin' Lizards" demo) to RiceScript - a stencil-masked planar
-// reflection. Ported specifically to exercise this compiler's new
-// glStencilFunc/glStencilOp/glStencilMask/GL_STENCIL_TEST support (see
-// kc_to_rice.md section 22 and rice_language_features.txt): without
-// stencil testing, the dinosaur's reflection "leaks" through to the
-// underside of the floor when the camera looks up from below; with it,
-// the reflection is correctly masked to only where the floor actually
-// is. Press SPACE to toggle stenciling on/off and see the difference
-// (matches the original's right-click "Toggle stenciling" menu entry -
-// simplified to a key since this compiler exposes no context menu API).
-// Drag with any mouse button held to orbit (original used left-button
-// drag specifically via GLUT's per-button callbacks; bstatus here is a
-// single "any button" flag, so that's simplified to "any button").
-//
-// Differences from the original, and why:
-//
-// - No GLU tessellator or display lists exist in this compiler,
-//   so makeDinosaur()'s extrudeSolidFromPolygon (concave 2D polygon ->
-//   extruded 3D solid via glNewList) is reimplemented from scratch: a
-//   general ear-clipping triangulator (triangulate() below) replaces
-//   GLU's tessellator for the two end caps, and glBeginMesh/glMesh
-//   (this compiler's closest equivalent to display lists) replaces
-//   glNewList/glCallList.
-// - No fixed-function lighting (glLightfv/glMaterialfv) exists either -
-//   WebGL has none - so lighting is a small custom vertex shader at the
-//   bottom of this file computing the same two lights (one positional
-//   green-tinted with GL-style constant+linear attenuation, one
-//   directional red-tinted) against a per-vertex base color baked in at
-//   mesh-record time (glColor4f standing in for glMaterialfv, since
-//   there's no separate material call). A uLit uniform switches the one
-//   shader between "lit" (dinosaur) and "flat passthrough" (floor,
-//   matching the original's glDisable(GL_LIGHTING) around drawFloor).
-// - No glFrontFace exists (only glCullFace), so every place the
-//   original flips front-face convention (the extrusion's end caps, and
-//   the floor's two-sided top/bottom pass) is instead done by literally
-//   reversing the vertex winding for that pass - same visual result.
-// - The side walls of each extruded solid are flat-shaded per edge
-//   (one glNormal per quad) rather than the original's smoothly
-//   interpolated per-column normals within a GL_QUAD_STRIP + GL_FLAT
-//   shademodel trick - simpler, and this compiler has no
-//   glShadeModel(GL_FLAT) to reproduce that trick exactly anyway.
-// - jump/idle animation and mouse drag are driven by klock()/mousx/
-//   mousy/bstatus (this environment's ambient input) instead of GLUT's
-//   idle/motion callbacks; angle math is identical.
+// reflection. 
+// Find original at
+// https://www.opengl.org/archives/resources/code/samples/mjktips/Reflect.html
+
+// Stencil testing masks out the dino under the floor.
+// Press space to toggle stencil masking on/off.
 
 #option stencil 1
 
@@ -60,10 +23,7 @@ static double bodyWidth = 3.0;
 
 // Cross-section polygons, straight from reflectdino.c's body/arm/leg/eye
 // arrays, flattened to (x,y) pairs. Declared at a shared MAXPTS*2 size
-// (unused trailing slots are simply never read, since every call passes
-// the real point count alongside) so they all fit the one triangulate()/
-// buildSolid() signature below - this compiler requires an array
-// argument's declared size to match the parameter's exactly.
+// unused array slots/indices are never read.
 static double bodyPts[MAXPTS*2] = {
   0,3, 1,1, 5,1, 8,4, 10,4, 11,5, 11,11.5, 13,12, 13,13, 10,13.5, 13,14,
   13,15, 11,16, 8,16, 7,15, 7,13, 8,12, 7,11, 6,6, 4,3, 3,2, 1,2
@@ -328,6 +288,8 @@ drawFloor(int reversed)
 
 ()
 {
+  cls(0); // Make 2D stuff clear (make text look ok)
+  
   if (numframes == 0) {
     glCullFace(GL_BACK);
     glEnable(GL_DEPTH_TEST);
@@ -458,3 +420,4 @@ void main()
 {
   gl_FragColor = vColor;
 }
+

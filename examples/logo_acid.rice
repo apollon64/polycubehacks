@@ -1,0 +1,550 @@
+// Hypercube and Radial Blur
+#use glsl_math
+
+enum {
+  SQUARES_TEX = 0,
+  CIRCLES_TEX = 1,
+  
+  CHECK_TEX = 2,
+  BRICK_TEX = 3,
+  TEX_A = 4, 
+  TEX_B = 5, 
+  TEX_LOGO = 6,
+  
+  CHECK_SIZE = 8,
+  BRICK_W = 16,
+  BRICK_H = 16
+};
+static double checkerBuf[CHECK_SIZE * CHECK_SIZE]; // one packed RGBA value per pixel -- see buildCheckerTexture()
+static double brickBuf[BRICK_W * BRICK_H];
+
+static mat4 bendForwardMat;
+static mat4 bendLeftMat;
+static mat4 bendRightMat;
+
+
+static int uTexLoc;
+static int uLightDirLoc;
+static int uClipPlaneLoc;
+
+static vec4 logo_centroid;
+static int logo_verts = 0;
+
+static enable_feedback_effect = 1;
+
+// Begin Feedback helpers.
+bindSampler0(int texIdx)
+{
+    glActiveTexture(0);
+    glBindTex(0, texIdx);
+    int loc = glGetUniformLoc("tex0");
+    glUniform1i(loc, 0);
+}
+bindSampler1(int texIdx)
+{
+    glActiveTexture(1);
+    glBindTex(1, texIdx);
+    int loc = glGetUniformLoc("tex1");
+    glUniform1i(loc, 1);
+}
+// End Feedback effect helpers
+
+mat4
+matTranslate(tx, ty, tz)
+{
+  return mat4(1,0,0,0,  0,1,0,0,  0,0,1,0,  tx,ty,tz,1);
+}
+
+mat4
+matRotateX(deg)
+{
+  mat4 m = mat4(1.);
+  rotate(m,deg,1,0,0);
+  return m;
+}
+
+mat4
+matRotateZ(deg)
+{
+  mat4 m = mat4(1.);
+  rotate(m,deg,0,0,1);
+  return m;
+}
+
+// CONFIRMED (found while debugging why this texture rendered as solid
+// red regardless of content): glSetTex expects a plain array buffer
+// PRE-PACKED as one value per pixel -- r + g*256 + b*65536 + a*16777216,
+// the exact same packing glReadPixels' default format uses -- NOT four
+// separate consecutive r,g,b,a doubles per pixel as the docs' own
+// example and this project's testsuite/behavior/gl_texture_shader/01
+// both assumed. Verified directly: uploading a buffer of unpacked
+// (10,200,30,255) quadruples sampled back as solid (115,0,0) garbage
+// (an averaged blend of raw unpacked numbers misread as packed pixels);
+// switching to one packed double per pixel sampled back as the exact
+// intended (10,200,30) instead.
+buildCheckerTexture()
+{
+  int y;
+  for (y = 0; y < CHECK_SIZE; y++) {
+    int x;
+    for (x = 0; x < CHECK_SIZE; x++) {
+      int idx = y * CHECK_SIZE + x;
+      int isWhite = (x + y) % 2;
+      double r = isWhite ? 255 : 255;
+      double g = isWhite ? 255 : 32;
+      double b = isWhite ? 255 : 32;
+      checkerBuf[idx] = r + g * 256 + b * 65536 + 255/*a*/ * 16777216;
+    }
+  }
+  glSetTex(CHECK_TEX, checkerBuf, CHECK_SIZE, CHECK_SIZE, GL_RGBA + GL_NEAREST);
+}
+
+// Procedural running-bond brick pattern (mortar every 4th row, vertical
+// joints staggered by half a brick-width every other row-band) -- a
+// generic, non-specific brick motif, generated the same way
+// buildCheckerTexture() generates its pattern rather than transcribed
+// from any particular source image.
+buildBrickTexture()
+{
+  int y;
+  for (y = 0; y < BRICK_H; y++) {
+    int band = int(y / 4);
+    int rowInBand = y % 4;
+    int isMortarRow = (rowInBand == 0);
+    int xOffset = (band % 2 == 0) ? 0 : 8;
+    int x;
+    for (x = 0; x < BRICK_W; x++) {
+      int xShifted = (x + xOffset) % BRICK_W;
+      int isMortarCol = (xShifted % 8 == 0);
+      int isMortar = isMortarRow || isMortarCol;
+      double r, g, b;
+      if (isMortar) { r = 230; g = 220; b = 200; }
+      else { r = 150; g = 45; b = 35; }
+      brickBuf[y * BRICK_W + x] = r + g * 256 + b * 65536 + 255 * 16777216;
+    }
+  }
+  glSetTex(BRICK_TEX, brickBuf, BRICK_W, BRICK_H, GL_RGBA + GL_NEAREST);
+}
+
+
+// Straight octagonal tube, local axis from z=0 to z=+length. CONFIRMED
+// (found by seeing every segment render as a disconnected, floating
+// piece instead of a continuous chain): logo.c's own cylinder data
+// (scp/dcp) spans z=0 to z=+length too, not -length -- each segment is
+// preceded by translate(0,0,-dist), which moves the origin FORWARD past
+// where the next joint needs to be, and the cylinder then fills
+// BACKWARD (+Z) from that new origin to reconnect with the previous
+// segment's end, not forward away from it. Using -length here instead
+// drew every tube extending further away from its own joint rather than
+// filling the gap back to it, so nothing ever touched.
+emitStraightTube(mat4 ctm, length, int draw)
+{
+  int k;
+  for (k = 0; k < 8; k++) {
+    double a0 = k * 45 * PI / 180;
+    double a1 = (k + 1) * 45 * PI / 180;
+    vec4 n0 = vec4(cos(a0), sin(a0), 0, 0);
+    vec4 n1 = vec4(cos(a1), sin(a1), 0, 0);
+    vec4 p0n = vec4(cos(a0), sin(a0), 0, 1);
+    vec4 p1n = vec4(cos(a1), sin(a1), 0, 1);
+    vec4 p0f = vec4(cos(a0), sin(a0), length, 1);
+    vec4 p1f = vec4(cos(a1), sin(a1), length, 1);
+
+    vec4 wn0 = ctm * n0;
+    vec4 wn1 = ctm * n1;
+    vec4 wp0n = ctm * p0n;
+    vec4 wp1n = ctm * p1n;
+    vec4 wp0f = ctm * p0f;
+    vec4 wp1f = ctm * p1f;
+
+    double u0 = k / 8.0;
+    double u1 = (k + 1) / 8.0;
+
+    if (draw)
+    {
+    glBegin(GL_QUADS);
+    glNormal(wn0.x, wn0.y, wn0.z); glTexCoord(u0, 0); glVertex(wp0n.x, wp0n.y, wp0n.z);
+    glNormal(wn1.x, wn1.y, wn1.z); glTexCoord(u1, 0); glVertex(wp1n.x, wp1n.y, wp1n.z);
+    glNormal(wn1.x, wn1.y, wn1.z); glTexCoord(u1, 1); glVertex(wp1f.x, wp1f.y, wp1f.z);
+    glNormal(wn0.x, wn0.y, wn0.z); glTexCoord(u0, 1); glVertex(wp0f.x, wp0f.y, wp0f.z);
+    glEnd();
+    }
+    
+    logo_centroid+=wp0n;
+    logo_centroid+=wp1n;
+    logo_centroid+=wp1f;
+    logo_centroid+=wp0f;
+    logo_verts+=4;
+  }
+}
+
+// Quarter-torus elbow: bend radius 1, tube radius 1, sweeping local
+// forward from -Z (phi=0) toward +Y (phi=90) about the local X axis --
+// matches BendForward's pivot at local (0,1,0). Drawn using the CTM as it
+// is BEFORE the corresponding bend matrix gets multiplied in (see the
+// header comment on the known deviation from logo.c's own convention).
+vec3
+elbowRingPoint(phi, k)
+{
+  double c = cos(phi);
+  double s = sin(phi);
+  double ka = k * 45 * PI / 180;
+  double kc = cos(ka);
+  double ks = sin(ka);
+  // ring_center(phi) = (0, 1-cos(phi), -sin(phi)); right=(1,0,0); up2=(0,cos(phi),sin(phi))
+  double px = kc;
+  double py = (1 - c) + ks * c;
+  double pz = -s + ks * s;
+  return vec3(px, py, pz);
+}
+
+vec3
+elbowRingNormal(phi, k)
+{
+  double c = cos(phi);
+  double s = sin(phi);
+  double ka = k * 45 * PI / 180;
+  double kc = cos(ka);
+  double ks = sin(ka);
+  return vec3(kc, ks * c, ks * s);
+}
+
+// rollDeg: this elbow's own local geometry is always a "bend forward"
+// quarter-torus (pivots about local X, curving toward local +Y -- see
+// elbowRingPoint/elbowRingNormal). That only lines up with the segment
+// that follows when the actual bend applied to ctm afterward is
+// bendForwardMat itself. bendLeftMat/bendRightMat are
+// matRotateZ(+-90) * bendForwardMat -- the SAME bend, rolled 90 degrees
+// about the tube's own long axis first -- so an elbow preceding one of
+// those needs the identical roll applied to ITS geometry too, or its far
+// end lands somewhere bendLeft/bendRightMat's actual target isn't.
+// CONFIRMED by direct computation: matRotateZ(90) applied to the
+// elbow's own phi=90 ring-center, (0,1,-1), lands at exactly (-1,0,-1) --
+// the same point bendRightMat*origin computes independently. Roll must
+// be 0 for the forward-bend junctions and +-90 (matching whichever of
+// bendRight/bendLeftMat follows) for the single-cylinder junctions.
+emitElbow(mat4 ctmIn, rollDeg, int draw)
+{
+  mat4 ctm = ctmIn * matRotateZ(rollDeg);
+  int ring;
+  for (ring = 0; ring < 6; ring++) {
+    double phi0 = ring * 15 * PI / 180;
+    double phi1 = (ring + 1) * 15 * PI / 180;
+    double v0 = ring / 6.0;
+    double v1 = (ring + 1) / 6.0;
+
+    int k;
+    for (k = 0; k < 8; k++) {
+      vec3 p00 = elbowRingPoint(phi0, k);
+      vec3 p01 = elbowRingPoint(phi0, k + 1);
+      vec3 p10 = elbowRingPoint(phi1, k);
+      vec3 p11 = elbowRingPoint(phi1, k + 1);
+      vec3 n00 = elbowRingNormal(phi0, k);
+      vec3 n01 = elbowRingNormal(phi0, k + 1);
+      vec3 n10 = elbowRingNormal(phi1, k);
+      vec3 n11 = elbowRingNormal(phi1, k + 1);
+
+      vec4 w00 = ctm * vec4(p00, 1); vec4 wn00 = ctm * vec4(n00, 0);
+      vec4 w01 = ctm * vec4(p01, 1); vec4 wn01 = ctm * vec4(n01, 0);
+      vec4 w10 = ctm * vec4(p10, 1); vec4 wn10 = ctm * vec4(n10, 0);
+      vec4 w11 = ctm * vec4(p11, 1); vec4 wn11 = ctm * vec4(n11, 0);
+
+      double u0 = k / 8.0;
+      double u1 = (k + 1) / 8.0;
+
+      if (draw){ 
+      glBegin(GL_QUADS);
+      glNormal(wn00.x, wn00.y, wn00.z); glTexCoord(u0, v0); glVertex(w00.x, w00.y, w00.z);
+      glNormal(wn01.x, wn01.y, wn01.z); glTexCoord(u1, v0); glVertex(w01.x, w01.y, w01.z);
+      glNormal(wn11.x, wn11.y, wn11.z); glTexCoord(u1, v1); glVertex(w11.x, w11.y, w11.z);
+      glNormal(wn10.x, wn10.y, wn10.z); glTexCoord(u0, v1); glVertex(w10.x, w10.y, w10.z);
+      glEnd();
+      }
+      
+      logo_centroid+=w00;
+      logo_centroid+=w01;
+      logo_centroid+=w10;
+      logo_centroid+=w11;
+      logo_verts+=4;
+    }
+  }
+}
+
+// Surface-only pass (tubes + elbows)
+buildLogoSurface(int draw)
+{
+  mat4 ctm = mat4(1.0); // Identity
+  //translate(ctm,5-0.2,-5+0.2,5-0.2);
+  int cycle;
+  for (cycle = 0; cycle < 6; cycle++) {
+    int seg;
+    for (seg = 0; seg < 2; seg++) {
+      ctm = ctm * matTranslate(0, 0, -7);
+      emitStraightTube(ctm, 7, draw);
+      emitElbow(ctm, 0, draw); // followed by bendForwardMat -- no roll needed
+      ctm = ctm * bendForwardMat;
+    }
+    ctm = ctm * matTranslate(0, 0, -5);
+    emitStraightTube(ctm, 5, draw);
+    // Roll must match whichever of bendRight/bendLeftMat follows below.
+    if (cycle % 2 == 0) { emitElbow(ctm, 90, draw); ctm = ctm * bendRightMat; }
+    else { emitElbow(ctm, -90, draw); ctm = ctm * bendLeftMat; }
+  }
+}
+
+drawLogo(dt, t, hyper_on) {
+glEnable(GL_DEPTH_TEST);
+  glClear();
+  
+  glLoadIdentity();
+  
+  rot_rad = t * 2.2;
+  
+  logo_verts=0;
+  logo_centroid = vec4(0.);
+  buildLogoSurface(0);
+  logo_centroid /= logo_verts;
+  
+  vec3 logoCenter = vec3(0.);//vec3(logo_centroid.x, logo_centroid.y, logo_centroid.z);
+  
+  
+  if (bstatus==1) rot_rad = mousx/xres * 2 * PI;
+  
+  gluLookAt(logoCenter.x + 30 * sin(rot_rad), logoCenter.y + 14,
+            logoCenter.z + 30 * cos(rot_rad),
+            logoCenter.x, logoCenter.y, logoCenter.z,
+            0, 1, 0);
+  gluPerspective(50, xres / yres, 1, 200);
+
+  glActiveTexture(0);
+  if (keystatus[KEY_A]) glBindTex(0, BRICK_TEX);
+  else glBindTex(0, CHECK_TEX);
+  
+  glSetShader("logoShader", "logoShader");
+  glUniform1i(uTexLoc, 0);
+  glUniform3f(uLightDirLoc, 0.4, 0.8, 0.3);
+
+  // sweeping clip plane, standing in for the original's up/down-arrow
+  // controlled plane[3] -- plane normal (1,0,-1) (normalized below),
+  // offset swept back and forth through the logo.
+  
+  static double sweep = 16.;
+  double nx = 0.7071, nz = -0.7071;
+  if (bstatus==2) sweep = -8. + mousx/xres *16.;
+  glUniform4f(uClipPlaneLoc, nx, 0, nz, sweep);
+
+  // Flip between rotating in X, Y or Z axis by 90 degrees.
+  static rx=0,ry=0,rz=0;
+  static tx=1,ty=0,tz=0;
+  static tnx=0,tny=0,tnz=0;
+  if (numframes==0) {
+    tx=1;
+    ty=0;
+    tz=0;
+  }
+  
+  static vec3 tint = vec3(1.);
+  if (tx > 0) { rx += dt*90; tx-=dt; if (tx<=0) { tx=0; ty=1; tz=0; tnx=0; tint=vec3(.4, .1,.1); } }
+  if (ty > 0) { ry += dt*90; ty-=dt; if (ty<=0) { tx=0; ty=0; tz=1; tnx=0; tint=vec3(.1, 1,.1); } }
+  if (tz > 0) { rz += dt*90; tz-=dt; if (tz<=0) { tx=0; ty=0; tz=0; tnx=1; tint=vec3(.1, .1,1); } }
+  if (tnx > 0) { rx += dt*90; tnx-=dt; if (tnx<=0) { tx=0; ty=0; tz=0; tnx=0; tny=0; tnz=1; tint=vec3(1, .5, .5); } }
+  if (tny > 0) { ry += dt*90; tny-=dt; if (tny<=0) { tx=0; ty=0; tz=0; tnx=0; tny=1; tnz=0; tint=vec3(1, .75, .35); } }
+  if (tnz > 0) { rz += dt*90; tnz-=dt; if (tnz<=0) { tx=1; ty=0; tz=0; tnx=0; tny=0; tnz=0; tint=vec3(1, 1, 1); } }
+  
+  glUniform3f( glGetUniformLoc("tint"), tint);
+  
+  glPushMatrix();
+     glRotate(rx,1,0,0);
+     glRotate(ry,0,1,0);
+     glRotate(rz,0,0,1);
+     
+     
+     
+     logo_centroid = -logo_centroid;
+     if (hyper_on)
+     {
+        logo_centroid.x += -5+(.5+.5*cos(1*t) ) * 2;
+        logo_centroid.y += -5+(.5+.5*cos(1.5*t*pi) ) * 2;
+        logo_centroid.z += (.5+.5*cos(1.6*t*2*pi) ) * 10;
+     }
+     
+     glTranslate(logo_centroid.x,logo_centroid.y,logo_centroid.z);
+        glCullFace(GL_NONE);
+        buildLogoSurface(1);
+  glPopMatrix();
+  
+
+}
+
+()
+{
+  cls(); // make 2D text clear properly.
+  if (numframes == 0) {
+    buildCheckerTexture();
+    buildBrickTexture();
+    glCullFace(GL_NONE); // sidesteps logo.c's glFrontFace(GL_CW) -- winding
+                          // is fixed at CCW-front in this compiler (see
+                          // kc_to_rice.md section 4), so this whole chain's
+                          // strip winding would need reversing by hand
+                          // otherwise; not culling is the simpler fix, same
+                          // one already used for the shadow-mapping demo.
+    bendForwardMat = matTranslate(0, 1, 0) * matRotateX(90) * matTranslate(0, -1, 0);
+    bendLeftMat = matRotateZ(-90) * bendForwardMat;
+    bendRightMat = matRotateZ(90) * bendForwardMat;
+
+    uTexLoc = glGetUniformLoc("uTex");
+    uLightDirLoc = glGetUniformLoc("uLightDir");
+    uClipPlaneLoc = glGetUniformLoc("uClipPlane");
+  }
+
+  static otim;
+  double t = klock();
+  dt = t - otim;
+  otim = t;
+
+  if (numframes == 0)
+  {
+        glCaptureTex(TEX_A, xres,yres);
+        glCaptureTex(TEX_B, xres,yres);
+        glCaptureTex(TEX_LOGO, xres,yres, GL_DEPTH_BUFFER_BIT); //!Need Zbuf!
+        
+        glDisable(GL_DEPTH_TEST);
+        glCullFace(GL_NONE);
+  }
+
+  int src = (numframes % 2 == 0) ? TEX_A : TEX_B;
+  int dst = (numframes % 2 == 0) ? TEX_B : TEX_A;  
+  
+  glClearColor(0.0, 0.0, 0.0, 1);
+  
+  static hyper_on = 0;
+  if (keystatus[KEY_SPACE]) { keystatus[KEY_SPACE] = 0; hyper_on = !hyper_on; }
+  if (keystatus[KEY_F]) { keystatus[KEY_F] = 0; enable_feedback_effect = !enable_feedback_effect; }
+  
+  if (numframes == 100) enable_feedback_effect = 1;
+     
+  //if (enable_feedback_effect) 
+  {
+    glCaptureBegin(TEX_LOGO);
+    drawLogo(dt, t, hyper_on);
+    glCaptureEnd();
+  } 
+  
+  setfont(10,12);
+  moveto(30, 30); printf("ROTATING HYPERCUBE! feedback=%d (key F) hyper=%d (space)", enable_feedback_effect, hyper_on);
+  //else {
+    //drawLogo(dt, t);
+  //}
+  
+  if (enable_feedback_effect)
+  {
+     glCullFace(GL_NONE);
+   
+     // --- feedback sim pass: zoom/rotate/decay the accumulated trail from
+     // last frame (src), then blend this frame's fresh logo render (captured above) 
+     // on top into dst -- the ping-pong pair set up
+     // above but never actually used until now.
+     glCaptureBegin(dst);
+        glsetshader("quad", "feedback");
+        bindSampler0(src);   // tex0 = previous feedback frame
+        bindSampler1(TEX_LOGO); // tex1 = this frame's fresh logo render
+        glUniform1f(glGetUniformLoc("uTime"), t);
+        glquad(); // fullscreen quad
+     glCaptureEnd();
+   
+     // --- display pass: blit the updated feedback texture to the screen ---
+     glsetshader("quad", "passthrough");
+     bindSampler0(dst);
+     glquad();
+  } 
+  
+  else {
+    glCullFace(GL_NONE);
+    glsetshader("quad", "passthrough");
+    bindSampler0(TEX_LOGO);
+    glquad(); // fullscreen quad
+  }
+
+
+  setcol(255, 255, 255);
+  moveto(10, yres - 20);
+  printf("logo_acid.rice");
+}
+
+@v:logoShader
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vWorldPos;
+void main()
+{
+  vNormal = gl_Normal;
+  vUV = gl_MultiTexCoord0.xy;
+  vWorldPos = gl_Vertex.xyz;
+  gl_Position = gl_ProjectionMatrix * gl_ModelViewMatrix * gl_Vertex;
+}
+
+@f:logoShader
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vWorldPos;
+uniform sampler2D uTex;
+uniform vec3 uLightDir;
+uniform vec4 uClipPlane;
+uniform vec3 tint;
+void main()
+{
+  //float clipDist = dot(vWorldPos, uClipPlane.xyz) + uClipPlane.w;
+  //if (clipDist < 0.0) discard;
+
+  vec3 n = normalize(vNormal);
+    float ndotl = max(dot(n, normalize(uLightDir)), 0.0);
+    vec4 texColor = texture2D(uTex, vUV);
+    vec3 lit = texColor.rgb * (0.3 + 0.7 * ndotl);
+    gl_FragColor = vec4( tint * lit, 1.0);
+}
+
+@v:quad
+varying vec4 p, c, t;
+varying vec3 n;
+
+void main()
+{
+   gl_Position = ftransform();
+   c = gl_Color;
+   p = gl_Position;
+   n = gl_Normal;
+   t = gl_MultiTexCoord0;
+}
+
+// Sim step: rotate+zoom the previous feedback frame back onto itself,
+// decay it, then max-blend this frame's fresh logo render on top
+@f:feedback
+varying vec4 p, c, t;
+varying vec3 n;
+uniform sampler2D tex0; // previous feedback frame
+uniform sampler2D tex1; // this frame's fresh logo render
+uniform float uTime;
+void main()
+{
+   vec2 uv = t.xy - 0.5;
+   float ang = 0.01;
+   float ca = cos(ang), sa = sin(ang);
+   uv = mat2(ca, -sa, sa, ca) * uv;
+   uv *= 0.965; // sampling slightly closer to center each step -> image zooms outward
+   uv += 0.5;
+
+   vec3 prev = texture2D(tex0, uv).rgb * 0.914; // decay
+   vec3 fresh = texture2D(tex1, t.xy).rgb;
+
+   gl_FragColor = vec4(max(prev, fresh), 1.0);
+}
+
+@f:passthrough
+varying vec4 p, c, t;
+varying vec3 n;
+uniform sampler2D tex0;
+void main()
+{
+   gl_FragColor = vec4(texture2D(tex0, t.xy).rgb, 1.0);
+}
+

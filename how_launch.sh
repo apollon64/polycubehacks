@@ -10,4 +10,5 @@ target="file://$(pwd)/index.html"
 # ignored (flags only apply to a brand-new process), which is what causes
 # "failed to download <script>" -- the script XHR gets blocked by the
 # default file:// same-origin policy.
+echo "Start index.html?=$1"
 chromium "$target" --allow-file-access-from-files --user-data-dir=/tmp/rice-chromium-profile

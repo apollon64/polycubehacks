@@ -1,0 +1,327 @@
+// Port of logo.c (the classic GLUT "cylinders + elbows" sample) to RICE.
+// see
+// https://www.opengl.org/archives/resources/code/samples/simple/logo.c
+#use glsl_math
+
+enum {
+  CHECK_TEX = 2, // leave slots 0,1 free (squares, circles)
+  BRICK_TEX = 3,
+  CHECK_SIZE = 8,
+  BRICK_W = 16,
+  BRICK_H = 16
+};
+static double checkerBuf[CHECK_SIZE * CHECK_SIZE]; // one packed RGBA value per pixel -- see buildCheckerTexture()
+static double brickBuf[BRICK_W * BRICK_H];
+
+static mat4 bendForwardMat;
+static mat4 bendLeftMat;
+static mat4 bendRightMat;
+static vec3 logoCenter; // see computeLogoCenter() -- lets the camera orbit the shape's actual center
+
+static int uTexLoc;
+static int uLightDirLoc;
+static int uClipPlaneLoc;
+static int uWire;
+
+mat4
+matTranslate(tx, ty, tz)
+{
+  return mat4(1,0,0,0,  0,1,0,0,  0,0,1,0,  tx,ty,tz,1);
+}
+
+mat4
+matRotateX(deg)
+{
+  mat4 m = mat4(1.);
+  rotate(m,deg,1,0,0);
+  return m;
+}
+
+mat4
+matRotateZ(deg)
+{
+  mat4 m = mat4(1.);
+  rotate(m,deg,0,0,1);
+  return m;
+}
+
+buildCheckerTexture()
+{
+  int y;
+  for (y = 0; y < CHECK_SIZE; y++) {
+    int x;
+    for (x = 0; x < CHECK_SIZE; x++) {
+      int idx = y * CHECK_SIZE + x;
+      int isWhite = (x + y) % 2;
+      double v = isWhite ? 255 : 0;
+      checkerBuf[idx] = v + v * 256 + v * 65536 + 255 * 16777216;
+    }
+  }
+  glSetTex(CHECK_TEX, checkerBuf, CHECK_SIZE, CHECK_SIZE, GL_RGBA + GL_NEAREST);
+}
+
+buildBrickTexture()
+{
+  int y;
+  for (y = 0; y < BRICK_H; y++) {
+    int band = int(y / 4);
+    int rowInBand = y % 4;
+    int isMortarRow = (rowInBand == 0);
+    int xOffset = (band % 2 == 0) ? 0 : 8;
+    int x;
+    for (x = 0; x < BRICK_W; x++) {
+      int xShifted = (x + xOffset) % BRICK_W;
+      int isMortarCol = (xShifted % 8 == 0);
+      int isMortar = isMortarRow || isMortarCol;
+      double r, g, b;
+      if (isMortar) { r = 230; g = 220; b = 200; }
+      else { r = 150; g = 45; b = 35; }
+      brickBuf[y * BRICK_W + x] = r + g * 256 + b * 65536 + 255 * 16777216;
+    }
+  }
+  glSetTex(BRICK_TEX, brickBuf, BRICK_W, BRICK_H, GL_RGBA + GL_NEAREST);
+}
+
+emitStraightTube(mat4 ctm, length)
+{
+  int k;
+  for (k = 0; k < 8; k++) {
+    double a0 = k * 45 * PI / 180;
+    double a1 = (k + 1) * 45 * PI / 180;
+    vec4 n0 = vec4(cos(a0), sin(a0), 0, 0);
+    vec4 n1 = vec4(cos(a1), sin(a1), 0, 0);
+    vec4 p0n = vec4(cos(a0), sin(a0), 0, 1);
+    vec4 p1n = vec4(cos(a1), sin(a1), 0, 1);
+    vec4 p0f = vec4(cos(a0), sin(a0), length, 1);
+    vec4 p1f = vec4(cos(a1), sin(a1), length, 1);
+
+    vec4 wn0 = ctm * n0;
+    vec4 wn1 = ctm * n1;
+    vec4 wp0n = ctm * p0n;
+    vec4 wp1n = ctm * p1n;
+    vec4 wp0f = ctm * p0f;
+    vec4 wp1f = ctm * p1f;
+
+    double u0 = k / 8.0;
+    double u1 = (k + 1) / 8.0;
+
+    glBegin(GL_TRIANGLES);
+    glColor(1,0,0); glNormal(wn0.x, wn0.y, wn0.z); glTexCoord(u0, 0); glVertex(wp0n.x, wp0n.y, wp0n.z);
+    glColor(0,1,0); glNormal(wn1.x, wn1.y, wn1.z); glTexCoord(u1, 0); glVertex(wp1n.x, wp1n.y, wp1n.z);
+    glColor(0,0,1); glNormal(wn1.x, wn1.y, wn1.z); glTexCoord(u1, 1); glVertex(wp1f.x, wp1f.y, wp1f.z);
+    
+    glColor(1,0,0); glNormal(wn1.x, wn1.y, wn1.z); glTexCoord(u1, 1); glVertex(wp1f.x, wp1f.y, wp1f.z);
+    glColor(0,1,0); glNormal(wn0.x,  wn0.y, wn0.z); glTexCoord(u0, 1); glVertex(wp0f.x, wp0f.y, wp0f.z);
+    glColor(0,0,1); glNormal(wn0.x, wn0.y, wn0.z); glTexCoord(u0, 0); glVertex(wp0n.x, wp0n.y, wp0n.z);
+    glEnd();
+  }
+}
+
+vec3
+elbowRingPoint(phi, k)
+{
+  double c = cos(phi);
+  double s = sin(phi);
+  double ka = k * 45 * PI / 180;
+  double kc = cos(ka);
+  double ks = sin(ka);
+  // ring_center(phi) = (0, 1-cos(phi), -sin(phi)); right=(1,0,0); up2=(0,cos(phi),sin(phi))
+  double px = kc;
+  double py = (1 - c) + ks * c;
+  double pz = -s + ks * s;
+  return vec3(px, py, pz);
+}
+
+vec3
+elbowRingNormal(phi, k)
+{
+  double c = cos(phi);
+  double s = sin(phi);
+  double ka = k * 45 * PI / 180;
+  double kc = cos(ka);
+  double ks = sin(ka);
+  return vec3(kc, ks * c, ks * s);
+}
+
+emitElbow(mat4 ctmIn, rollDeg)
+{
+  mat4 ctm = ctmIn * matRotateZ(rollDeg);
+  int ring;
+  for (ring = 0; ring < 6; ring++) {
+    double phi0 = ring * 15 * PI / 180;
+    double phi1 = (ring + 1) * 15 * PI / 180;
+    double v0 = ring / 6.0;
+    double v1 = (ring + 1) / 6.0;
+
+    int k;
+    for (k = 0; k < 8; k++) {
+      vec3 p00 = elbowRingPoint(phi0, k);
+      vec3 p01 = elbowRingPoint(phi0, k + 1);
+      vec3 p10 = elbowRingPoint(phi1, k);
+      vec3 p11 = elbowRingPoint(phi1, k + 1);
+      vec3 n00 = elbowRingNormal(phi0, k);
+      vec3 n01 = elbowRingNormal(phi0, k + 1);
+      vec3 n10 = elbowRingNormal(phi1, k);
+      vec3 n11 = elbowRingNormal(phi1, k + 1);
+
+      vec4 w00 = ctm * vec4(p00, 1); vec4 wn00 = ctm * vec4(n00, 0);
+      vec4 w01 = ctm * vec4(p01, 1); vec4 wn01 = ctm * vec4(n01, 0);
+      vec4 w10 = ctm * vec4(p10, 1); vec4 wn10 = ctm * vec4(n10, 0);
+      vec4 w11 = ctm * vec4(p11, 1); vec4 wn11 = ctm * vec4(n11, 0);
+
+      double u0 = k / 8.0;
+      double u1 = (k + 1) / 8.0;
+
+      glBegin(GL_TRIANGLES);
+      glColor(1,0,0); glNormal(wn00.x, wn00.y, wn00.z); glTexCoord(u0, v0); glVertex(w00.x, w00.y, w00.z);
+      glColor(0,0,1); glNormal(wn11.x, wn11.y, wn11.z); glTexCoord(u1, v1); glVertex(w11.x, w11.y, w11.z);
+      glColor(0,1,0); glNormal(wn01.x, wn01.y, wn01.z); glTexCoord(u1, v0); glVertex(w01.x, w01.y, w01.z);
+      
+      glColor(0,1,0); glNormal(wn10.x, wn10.y, wn10.z); glTexCoord(u0, v1); glVertex(w10.x, w10.y, w10.z);
+      glColor(1,0,0); glNormal(wn11.x, wn11.y, wn11.z); glTexCoord(u1, v1); glVertex(w11.x, w11.y, w11.z);
+      glColor(0,0,1); glNormal(wn00.x, wn00.y, wn00.z); glTexCoord(u0, v0); glVertex(w00.x, w00.y, w00.z);
+      
+      glEnd();
+    }
+  }
+}
+
+buildLogoSurface()
+{
+  mat4 ctm = mat4(1.0); // Identity
+  int cycle;
+  for (cycle = 0; cycle < 6; cycle++) {
+    int seg;
+    for (seg = 0; seg < 2; seg++) {
+      ctm = ctm * matTranslate(0, 0, -7);
+      emitStraightTube(ctm, 7);
+      emitElbow(ctm, 0); // followed by bendForwardMat -- no roll needed
+      ctm = ctm * bendForwardMat;
+    }
+    ctm = ctm * matTranslate(0, 0, -5);
+    emitStraightTube(ctm, 5);
+    // Roll must match whichever of bendRight/bendLeftMat follows below.
+    if (cycle % 2 == 0) { emitElbow(ctm, 90); ctm = ctm * bendRightMat; }
+    else { emitElbow(ctm, -90); ctm = ctm * bendLeftMat; }
+  }
+}
+
+()
+{
+  cls(); // make 2D text clear properly.
+  if (numframes == 0) {
+    buildCheckerTexture();
+    buildBrickTexture();
+    glCullFace(GL_BACK);
+    bendForwardMat = matTranslate(0, 1, 0) * matRotateX(90) * matTranslate(0, -1, 0);
+    bendLeftMat = matRotateZ(-90) * bendForwardMat;
+    bendRightMat = matRotateZ(90) * bendForwardMat;
+    logoCenter = vec3(-5,4,-5);
+
+    uTexLoc = glGetUniformLoc("uTex");
+    uLightDirLoc = glGetUniformLoc("uLightDir");
+    uClipPlaneLoc = glGetUniformLoc("uClipPlane");
+    uWire = glGetUniformLoc("uWire");
+  }
+
+  double t = klock();
+
+  glClearColor(0.08, 0.08, 0.1, 1);
+  glClear();
+  glEnable(GL_DEPTH_TEST);
+
+  glLoadIdentity();
+  rot_rad = t * 0.2;
+  if (bstatus==2) rot_rad = mousx/xres * 2 * PI;
+  gluLookAt(logoCenter.x + 30 * sin(rot_rad), logoCenter.y + 14,
+            logoCenter.z + 30 * cos(rot_rad),
+            logoCenter.x, logoCenter.y, logoCenter.z,
+            0, 1, 0);
+  gluPerspective(50, xres / yres, 1, 200);
+
+  glActiveTexture(0);
+  if (keystatus[KEY_A]) glBindTex(0, BRICK_TEX);
+  else glBindTex(0, CHECK_TEX);
+  glUniform1i(uTexLoc, 0);
+  glUniform3f(uLightDirLoc, 0.4, 0.8, 0.3);
+
+  // Sweeping clip plane done with a discard 
+  static double sweep = 16.;
+  double nx = 0.7071, nz = -0.7071;
+  if (bstatus==1) sweep = -8. + mousx/xres *16.;
+  glUniform4f(uClipPlaneLoc, nx, 0, nz, sweep);
+
+  glUniform1i(uWire, 0);
+  glSetShader("logoShader","logoShader");
+  buildLogoSurface();
+  
+  static wireframe=1;
+  if (keystatus[KEY_W]) { keystatus[KEY_W] = 0; wireframe=!wireframe; }
+  glUniform1i(uWire, wireframe);
+  glUniform4f(uClipPlaneLoc, nx, 0, nz, 1000);
+  buildLogoSurface();
+  
+
+  setcol(255, 255, 255);
+  moveto(10, yres - 20);
+  printf("port of logo.c");
+}
+
+@v:logoShader
+varying vec4 vbc;
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vWorldPos;
+
+varying vec3 vBary;
+void main()
+{
+   vbc=gl_Color;
+   vNormal = gl_Normal;
+   vUV = gl_MultiTexCoord0.xy;
+   vWorldPos = gl_Vertex.xyz;
+   gl_Position = gl_ProjectionMatrix * gl_ModelViewMatrix * gl_Vertex;
+   
+}
+
+@f:logoShader
+varying vec4 vbc;
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vWorldPos;
+
+varying vec3 vBary;
+uniform sampler2D uTex;
+uniform vec3 uLightDir;
+uniform vec4 uClipPlane;
+uniform int uWire;
+void main()
+{
+   if (uWire==1)
+   {
+     if(vbc.x < 0.05 || vbc.y < 0.05 || vbc.z < 0.05) 
+     { 
+       gl_FragColor = vec4(1.0, 1.0, 0.0, 1.0);
+       
+     } 
+     else 
+     discard;
+   }
+   else{
+
+   float clipDist = dot(vWorldPos, uClipPlane.xyz) + uClipPlane.w;
+   if (clipDist < 0.0) discard;
+   
+   vec3 n = normalize(vNormal);
+   float ndotl = max(dot(n, normalize(uLightDir)), 0.0);
+   vec4 texColor = texture2D(uTex, vUV);
+   vec3 lit = texColor.rgb * (0.3 + 0.7 * ndotl);
+   gl_FragColor = vec4(lit, 1.0);
+   }
+   
+   
+
+   
+}
+
+
